@@ -20,9 +20,10 @@ from anthropic import Anthropic
 from get_ids_mcp import *
 from general_mcp import *
 from damage_mcp import *
+from turbine_mcp import *
 from mcp_utils import MAIA_TOOLS
 from maia_prompt import BASE_PROMPT
-from maia_page_context import CURRENT_PAGE_CONTEXT
+from maia_page_context import get_report_page_context
 
 class MAIAChatModel(BaseChatModel):
     client_model: Any = None
@@ -33,7 +34,7 @@ class MAIAChatModel(BaseChatModel):
     
     temperature: float = 0.0
     top_p: float = 1.0
-    max_tokens: int = 1024
+    max_tokens: int = 4096
     
     tools: List[Any] = None
     tool_choice: str = "auto"
@@ -108,6 +109,9 @@ class MAIAChatModel(BaseChatModel):
         mistral_resp = self.client_model.chat.complete(**mistral_params)
         client_msg = mistral_resp.choices[0].message
         
+        if mistral_resp.choices[0].finish_reason == 'length':
+            print("DEBUG TRUNCATED")
+        
         tool_calls = []
         if hasattr(client_msg, "tool_calls") and client_msg.tool_calls:
             for tool_call in client_msg.tool_calls:
@@ -143,6 +147,7 @@ class MAIAChatModel(BaseChatModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    context: dict
 
 class ChatResponse(BaseModel):
     answer: str
@@ -158,6 +163,17 @@ maia_llm = MAIAChatModel(
     mistral_key='***',
 )
 
+# TO COPY IN THE SWAGGER
+chat_request_example = {
+  "message": "hello",
+  "session_id": "string",
+  "context": {
+    "page_type": "report",
+    "planification_id": 14630
+  }
+}
+# Butera planification_id = 24413
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     session_id = request.session_id or str(uuid.uuid4())
@@ -165,7 +181,12 @@ async def chat(request: ChatRequest):
     session_history = SESSIONS.get(session_id, [])
     
     # Add the prompt in front of the messages
-    session_history.insert(0, SystemMessage(content=BASE_PROMPT + f"\n\nPAGE CONTEXT:\n{json.dumps(CURRENT_PAGE_CONTEXT, indent=2)}"))
+    if request.context['page_type'] == 'report':
+        current_page_context = get_report_page_context(request.context['planification_id'])
+    else:
+        current_page_context = {'webpage_type': 'homepage'}
+    
+    session_history.insert(0, SystemMessage(content=BASE_PROMPT + "\n\nPAGE CONTEXT:\n" + str(current_page_context)))
     
     session_history.append(HumanMessage(content=request.message))
     
@@ -175,30 +196,9 @@ async def chat(request: ChatRequest):
     while llm_msg.tool_calls and tool_call_secure_cpt < 10:
         session_history.append(llm_msg)
         for tool_call in llm_msg.tool_calls:
-            if tool_call["name"] == "get_damage_type_ids":
-                tool_output = get_damage_type_ids.invoke(tool_call["args"])
-            elif tool_call["name"] == "get_country_ids_by_name":
-                tool_output = get_country_ids_by_name.invoke(tool_call["args"])
-            elif tool_call["name"] == "get_turbine_model_ids_by_name":
-                tool_output = get_turbine_model_ids_by_name.invoke(tool_call["args"])
-            elif tool_call["name"] == "get_sites":
-                tool_output = get_sites.invoke(tool_call["args"])
-            
-            elif tool_call["name"] == "count_damage_on_turbines":
-                tool_output = count_damage_on_turbines.invoke(tool_call["args"])
-            elif tool_call["name"] == "count_damage_on_a_site_turbines":
-                tool_output = count_damage_on_a_site_turbines.invoke(tool_call["args"])
-            elif tool_call["name"] == "estimate_repair_cost":
-                tool_output = estimate_repair_cost.invoke(tool_call["args"])
-            elif tool_call["name"] == "get_individual_damage_infos":
-                tool_output = get_individual_damage_infos.invoke(tool_call["args"])
-            elif tool_call["name"] ==  "estimate_damage_repair_frequency":
-                tool_output = estimate_damage_repair_frequency.invoke(tool_call["args"])
-            
-            elif tool_call["name"] == "get_wind_index_explanation":
-                tool_output = get_wind_index_explanation.invoke(tool_call["args"])
-            elif tool_call["name"] == "what_is_new":
-                tool_output = what_is_new.invoke(tool_call["args"])
+            tool_dict = {t.name: t for t in MAIA_TOOLS}
+            tool = tool_dict.get(tool_call["name"])
+            tool_output = tool.invoke(tool_call["args"]) if tool else f"Unknown tool: {tool_call['name']}"
             
             session_history.append(
                 ToolMessage(

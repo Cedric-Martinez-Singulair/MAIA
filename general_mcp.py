@@ -86,7 +86,10 @@ def what_is_new(look_back_days: int = 10) -> str:
         LEFT JOIN fir_causes ON fir_causes.id = _firs.cause_id \
         LEFT JOIN (SELECT * FROM incident_records WHERE deleted_at IS NULL AND criticality_id = 5) _incident_records \
         ON _incident_records.planification_id = _inspected.planification_id AND _incident_records.turbine_id = _inspected.turbine_id \
-        WHERE _firs.cause_id IS NOT NULL OR _incident_records.criticality_id IS NOT NULL \
+        WHERE (_incident_records.dismissed IS NULL OR _incident_records.dismissed = FALSE) \
+        AND (_incident_records.decision_id IS NULL OR _incident_records.decision_id != 0) \
+        AND _incident_records.deleted_at IS NULL \
+        AND _firs.cause_id IS NOT NULL OR _incident_records.criticality_id IS NOT NULL \
         ORDER BY CAST(_inspected.date AS VARCHAR) DESC \
     "
     
