@@ -11,18 +11,32 @@ Deux analyses, deux logiques distinctes :
   elles n'ont pas d'identité stable. La référence est la longueur érodée totale
   de la pale, avec un seuil unique de 5%.
 
-Traduit de l'ancien code de génération de rapports : mêmes calculs, mêmes
-seuils, sortie structurée au lieu de phrases.
+Deux modes d'appel côté érosion :
 
-Lancement :
-    python stats_utils.py <turbine_id> <planification_id> [previous_planification_id]
+- une turbine : planification_id + turbine_id, comportement historique
+- un site entier : planification_id + site_id, toutes les turbines du parc,
+  chacune avec SA campagne courante et SA campagne précédente — un site
+  inspecté en plusieurs lots reste couvert intégralement.
+
+Fonctions publiques attendues par les @tool du serveur MCP :
+
+    resolve_previous_planification(turbine_id, planification_id)
+    resolve_site_turbine_ids(site_id)
+    resolve_turbine_names(turbine_ids)
+    resolve_current_by_turbine(turbine_ids, planification_id)
+    resolve_previous_by_turbine(turbine_ids_or_map, planification_id=None)
+    fetch_crack_data / fetch_erosion_data / fetch_erosion_data_bulk
+    build_cracks_by_face / build_blade_erosion
+    select_blade / select_turbine
+    compare_blade_cracks / compare_blade_erosion
+    compare_turbines
+    BLADES, FACES
 """
 
 from __future__ import annotations
 
 import json
 import math
-import sys
 from dataclasses import asdict, dataclass, field
 
 import pandas as pd
@@ -73,6 +87,14 @@ CRACK_GROWTH_THRESHOLDS = {
 # pas ces cas : on remonte la taille courante sans delta.
 AREA_SHAPES = ["multibranched", "stripes"]
 
+# Distance maximale, en mètres, pour apparier deux fissures qui ne se chevauchent pas.
+CRACK_MATCH_MAX_GAP = 0.5
+
+# Fenêtre d'isolement : le repli par proximité n'est tenté que si la zone ne
+# contient aucune autre fissure précédente à cette distance. Sinon, rien ne dit
+# laquelle des deux est la bonne.
+CRACK_MATCH_ISOLATION_RADIUS = 5.0
+
 
 # =========================================================================== #
 # Constantes érosion
@@ -95,11 +117,14 @@ WW_DB_PARAMS = dict(dbname="windwatch", user="singulair", password="singulair",
                     host="localhost")
 
 
-# Campagnes d'inspection d'une turbine, de la plus récente à la plus ancienne.
+# Campagne d'inspection précédant celle donnée, pour une turbine.
 # asset_scope garantit que la turbine était bien dans le périmètre inspecté.
 PLANIFICATION_HISTORY_QUERY = """
     SELECT _asset_scope.planification_id, date
-    FROM (SELECT id, date FROM planifications WHERE deleted_at IS NULL) _planifications
+    FROM (SELECT id, date FROM planifications
+          JOIN controle_planification
+            ON controle_planification.planification_id = planifications.id
+          WHERE deleted_at IS NULL AND controle_planification.controle_id = 1) _planifications
     JOIN (SELECT planification_id, turbine_id FROM asset_scope WHERE deleted_at IS NULL) _asset_scope
       ON _asset_scope.planification_id = _planifications.id
     JOIN (SELECT turbine_id, planification_id, count(*) FROM incident_records
@@ -112,6 +137,14 @@ PLANIFICATION_HISTORY_QUERY = """
     LIMIT 1
 """
 
+# Même requête, borne incluse : la campagne "courante" d'une turbine, c'est-à-dire
+# la plus récente à la date de la planification demandée ou avant. Une turbine
+# inspectée dans un autre lot du même site a ainsi sa propre campagne.
+CURRENT_PLANIFICATION_QUERY = PLANIFICATION_HISTORY_QUERY.replace(
+    "AND date < (SELECT date FROM planifications WHERE id = %s)",
+    "AND date <= (SELECT date FROM planifications WHERE id = %s)",
+)
+
 
 # Les jointures INNER sont conservées même quand leur colonne n'est pas
 # sélectionnée : elles filtrent les lignes, les retirer changerait le résultat.
@@ -119,9 +152,16 @@ PLANIFICATION_HISTORY_QUERY = """
 CRACK_QUERY = """
     SELECT
         _incidents.id AS damage_id,
+        _incidents.turbine_id AS turbine_id,
         components_turbines.name AS blade,
         parts.label_en AS side,
         FLOOR(radius) AS radius,
+        ((radius_img - (((("Sensor_resolution_height" / 2)
+          - (floor(((xy_coordinates->0->0)->1)::jsonb::NUMERIC) + 20))
+          * conv_pixelh_m) / 1000))
+        + (radius_img - (((("Sensor_resolution_height" / 2)
+          - (floor(((xy_coordinates->0->2)->1)::jsonb::NUMERIC) + 20))
+          * conv_pixelh_m) / 1000))) / 2.0 AS radius_float,
         components.label_en AS part_damaged,
         CASE WHEN criticality_id = 6 THEN 0 ELSE criticality_id END AS criticality,
         damage_axes.name AS crack_axis,
@@ -154,13 +194,16 @@ CRACK_QUERY = """
     JOIN models ON models.id = turbines.model_name
     WHERE conv_pixelh_m IS NOT NULL AND conv_pixelw_m IS NOT NULL
       AND defect_types.label_en = %s
-      AND components.label_en != 'Drain Hole'
+      AND components.label_en != 'Drain hole'
 """
 
 # L'érosion n'a pas besoin des colonnes de position spatiale : elle s'apparie
 # par plage de rayons, pas par bounding box.
+# turbine_id est sélectionné : select_turbine en a besoin pour découper le
+# DataFrame quand on charge plusieurs turbines d'un coup.
 EROSION_QUERY = """
     SELECT
+        _incidents.turbine_id AS turbine_id,
         components_turbines.name AS blade,
         parts.label_en AS side,
         FLOOR(radius) AS radius,
@@ -191,12 +234,118 @@ EROSION_QUERY = """
       AND defect_types.label_en = %s
 """
 
+# Même requête, mais sur un lot de turbines : une seule requête au lieu de N.
+EROSION_QUERY_BULK = EROSION_QUERY.replace(
+    "AND planification_id = %s AND turbine_id = %s",
+    "AND planification_id = %s AND turbine_id = ANY(%s)",
+)
+
+
+def cursor_to_dataframe(cursor):
+    """Curseur psycopg2 classique -> DataFrame avec les vrais noms de colonnes.
+
+    Sans le paramètre columns, pandas numéroterait les colonnes 0, 1, 2... et
+    tous les accès par nom du reste du fichier échoueraient.
+    """
+    rows = cursor.fetchall()
+    columns = [column[0] for column in cursor.description]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def fetch_crack_data(planification_id, turbine_id):
+    TW_DB_CURSOR.execute(CRACK_QUERY, (planification_id, turbine_id, CRACK_DEFECT_TYPE))
+    return cursor_to_dataframe(TW_DB_CURSOR)
+
+
+def fetch_erosion_data(planification_id, turbine_id):
+    TW_DB_CURSOR.execute(EROSION_QUERY, (planification_id, turbine_id, LEE_DEFECT_TYPE))
+    return cursor_to_dataframe(TW_DB_CURSOR)
+
+
+def fetch_erosion_data_bulk(planification_id, turbine_ids):
+    """Dommages d'érosion de plusieurs turbines, en une seule requête."""
+    if not turbine_ids:
+        return pd.DataFrame()
+
+    TW_DB_CURSOR.execute(
+        EROSION_QUERY_BULK,
+        (planification_id, list(turbine_ids), LEE_DEFECT_TYPE),
+    )
+    return cursor_to_dataframe(TW_DB_CURSOR)
+
 
 def resolve_previous_planification(turbine_id, planification_id):
     """Campagne d'inspection précédant celle donnée, ou None s'il n'y en a pas."""
     TW_DB_CURSOR.execute(PLANIFICATION_HISTORY_QUERY, (turbine_id, planification_id))
     row = TW_DB_CURSOR.fetchone()
     return row[0] if row else None  # planification_id, première colonne du SELECT
+
+
+def resolve_site_turbine_ids(site_id):
+    """TOUTES les turbines du site, indépendamment des campagnes.
+
+    On ne part pas d'asset_scope : une turbine peut avoir été inspectée dans un
+    autre lot que la planification demandée, et elle serait alors invisible.
+    """
+    TW_DB_CURSOR.execute(
+        "SELECT id FROM turbines "
+        "WHERE site_id = %s AND deleted_at IS NULL "
+        "ORDER BY name",
+        (site_id,),
+    )
+    return [row[0] for row in TW_DB_CURSOR.fetchall()]
+
+
+def resolve_turbine_names(turbine_ids):
+    """{turbine_id: nom} en une requête.
+
+    Le nom ne vient pas des requêtes de dommages : components_turbines.name y
+    désigne la pale, pas la turbine.
+    """
+    if not turbine_ids:
+        return {}
+
+    TW_DB_CURSOR.execute(
+        "SELECT id, name FROM turbines WHERE id = ANY(%s)",
+        (list(turbine_ids),),
+    )
+    return {row[0]: row[1] for row in TW_DB_CURSOR.fetchall()}
+
+
+def resolve_current_by_turbine(turbine_ids, planification_id):
+    """{turbine_id: sa campagne courante} — celle du lot où elle a été inspectée.
+
+    Pour une turbine inspectée dans la planification demandée, c'est elle-même.
+    Pour une turbine d'un autre lot du même site, c'est sa propre campagne.
+    Une turbine absente du dictionnaire n'a jamais été inspectée à cette date.
+    """
+    current_by_turbine = {}
+    for turbine_id in turbine_ids:
+        TW_DB_CURSOR.execute(CURRENT_PLANIFICATION_QUERY, (turbine_id, planification_id))
+        row = TW_DB_CURSOR.fetchone()
+        if row:
+            current_by_turbine[turbine_id] = row[0]
+    return current_by_turbine
+
+
+def resolve_previous_by_turbine(turbine_ids_or_map, planification_id=None):
+    """{turbine_id: planification précédente}.
+
+    Accepte soit une liste de turbines avec une planification commune, soit le
+    dictionnaire {turbine_id: sa campagne courante} — chaque turbine est alors
+    comparée à ce qui précède SA campagne, pas celle du lot voisin.
+    """
+    if isinstance(turbine_ids_or_map, dict):
+        pairs = list(turbine_ids_or_map.items())
+    else:
+        pairs = [(turbine_id, planification_id) for turbine_id in turbine_ids_or_map]
+
+    previous_by_turbine = {}
+    for turbine_id, current_id in pairs:
+        previous = resolve_previous_planification(turbine_id, current_id)
+        if previous is not None:
+            previous_by_turbine[turbine_id] = previous
+    return previous_by_turbine
 
 
 # =========================================================================== #
@@ -242,22 +391,18 @@ def add_wind_and_size(blade_data):
     return blade_data
 
 
-def cursor_to_dataframe(cursor):
-    """Curseur psycopg2 classique -> DataFrame avec les vrais noms de colonnes.
-
-    Sans le paramètre columns, pandas numéroterait les colonnes 0, 1, 2... et
-    tous les accès par nom du reste du fichier échoueraient.
-    """
-    rows = cursor.fetchall()
-    columns = [column[0] for column in cursor.description]
-    return pd.DataFrame(rows, columns=columns)
-
-
 def select_blade(full_data, blade):
     """Lignes d'une pale, ou DataFrame vide."""
     if full_data.empty:
         return pd.DataFrame()
     return full_data.loc[full_data["blade"] == blade]
+
+
+def select_turbine(full_data, turbine_id):
+    """Lignes d'une turbine dans un DataFrame multi-turbines."""
+    if full_data.empty:
+        return pd.DataFrame()
+    return full_data.loc[full_data["turbine_id"] == turbine_id]
 
 
 # =========================================================================== #
@@ -277,7 +422,10 @@ def boxes_overlap(box1, box2):
 
     x1_min, x1_max, y1_min, y1_max = box1
     x2_min, x2_max, y2_min, y2_max = box2
-    if x1_min >= x2_max or x2_min >= x1_max:
+
+    # Comparaisons non strictes en X : sur le bord de fuite, dp_start == dp_end,
+    # la boîte est plate et un test strict rejetterait tout.
+    if x1_min > x2_max or x2_min > x1_max:
         return False
     if y1_min >= y2_max or y2_min >= y1_max:
         return False
@@ -285,29 +433,25 @@ def boxes_overlap(box1, box2):
 
 
 def get_bounding_box_in_space(row):
-    """Position du dommage dans l'espace de la pale : c'est elle qui permet l'appariement."""
+    """Position du dommage dans l'espace de la pale : c'est elle qui permet l'appariement.
+
+    radius_float est calculé en SQL : c'est le centre du dommage. On redescend
+    d'une demi-hauteur pour obtenir la borne basse de l'intervalle.
+    """
     try:
-        if (pd.isna(row["radius_img"]) or not row["radius_img"] or not row["image_height"]
-                or not row["conv_pixelh_m"] or not row["blade_length"]
+        if (pd.isna(row["radius_float"]) or not row["blade_length"]
                 or not row["dp_start"] or not row["dp_end"] or not row["height"]):
             return pd.Series([None], index=["bbox_espace"])
 
-        coords = json.loads(str(row["xy_coordinates"]))
-        if not coords or not isinstance(coords[0], list):
-            return pd.Series([None], index=["bbox_espace"])
-
-        y_min = min(point[1] for point in coords[0][:-1])
-        bas_bbox_m = ((y_min - float(row["image_height"]) / 2)
-                      * float(row["conv_pixelh_m"])) / 1000
-
-        blade_length = float(row["blade_length"])
-        hauteur = min(float(row["radius_img"]) + bas_bbox_m, blade_length)
+        height_m = float(row["height"]) / 1000
+        bas = float(row["radius_float"]) - height_m / 2
+        haut = min(bas + height_m, float(row["blade_length"]))
 
         return pd.Series([[
             float(row["dp_start"]),
             float(row["dp_end"]),
-            hauteur,
-            hauteur + float(row["height"]) / 1000,
+            bas,
+            haut,
         ]], index=["bbox_espace"])
 
     except Exception as exc:
@@ -450,18 +594,51 @@ def enrich_cracks_with_measures(cracks_by_face):
     return cracks_by_face
 
 
+def build_cracks_by_face(blade_data):
+    """DataFrame d'une pale -> fissures classées par face, mesures incluses."""
+    if blade_data.empty:
+        return None
+
+    cracks = add_wind_and_size(blade_data)
+    cracks = cracks.join(cracks.apply(get_bounding_box_in_space, axis=1))
+
+    return enrich_cracks_with_measures(group_cracks_by_face(cracks))
+
+
+def _vertical_gap(box1, box2):
+    """Écart en mètres entre deux intervalles verticaux. 0 s'ils se chevauchent."""
+    return max(0.0, max(box1[2], box2[2]) - min(box1[3], box2[3]))
+
+
 def find_matching_previous_crack(crack, previous_cracks):
-    """Apparie une fissure à celle de la campagne précédente, par chevauchement de bbox."""
+    """Apparie une fissure à celle de la campagne précédente.
+
+    Passe 1 : chevauchement géométrique franc.
+    Passe 2 : proximité verticale, mais uniquement si la fissure est isolée —
+    aucune autre fissure précédente dans un rayon de CRACK_MATCH_ISOLATION_RADIUS
+    mètres. En zone dense, on préfère ne rien apparier qu'apparier au hasard.
+    """
     if not previous_cracks or crack.get("bbox_espace") is None:
         return None
 
-    for previous in previous_cracks:
-        if previous.get("orientation") != crack.get("orientation"):
-            continue
-        if previous.get("shape") != crack.get("shape"):
-            continue
-        if boxes_overlap(crack["bbox_espace"], previous.get("bbox_espace")):
+    candidates = [previous for previous in previous_cracks
+                  if previous.get("bbox_espace") is not None]
+
+    # Passe 1 : chevauchement
+    for previous in candidates:
+        if boxes_overlap(crack["bbox_espace"], previous["bbox_espace"]):
             return previous
+
+    # Passe 2 : proximité, si et seulement si la zone est isolée
+    nearby = [previous for previous in candidates
+              if _vertical_gap(crack["bbox_espace"], previous["bbox_espace"])
+              <= CRACK_MATCH_ISOLATION_RADIUS]
+
+    if len(nearby) != 1:
+        return None
+
+    if _vertical_gap(crack["bbox_espace"], nearby[0]["bbox_espace"]) <= CRACK_MATCH_MAX_GAP:
+        return nearby[0]
 
     return None
 
@@ -508,7 +685,9 @@ class CrackEvolution:
     previous_damage_id: int | None
     blade: str
     face: str
-    status: str                       # new / grown / shrunk / stable / repaired
+    # new / grown / stable / repaired — jamais "shrunk" : une fissure ne
+    # rétrécit pas, une baisse de mesure est classée "stable".
+    status: str
     orientation: str | None = None
     shape: str | None = None
     part: str | None = None
@@ -548,7 +727,7 @@ def compare_blade_cracks(cracks_by_face, previous_cracks_by_face, blade):
                 matched_previous_ids.add(match["id"])
 
             size, unit = get_crack_measurement(crack)
- 
+
             evolution = CrackEvolution(
                 damage_id=crack["id"],
                 previous_damage_id=match["id"] if match else None,
@@ -585,9 +764,14 @@ def compare_blade_cracks(cracks_by_face, previous_cracks_by_face, blade):
                         evolution.growth_threshold is not None
                         and evolution.growth_percentage >= evolution.growth_threshold)
 
+                    # Une fissure ne peut pas rétrécir : un delta négatif est un
+                    # écart de mesure, pas une évolution.
+                    if evolution.significant and delta <= 0:
+                        evolution.significant = False
+
                     if evolution.significant:
-                        evolution.status = "grown" if delta > 0 else "shrunk"
-                        if delta > 0 and match.get("wind") in WIND_GROWTH_PREDICTED:
+                        evolution.status = "grown"
+                        if match.get("wind") in WIND_GROWTH_PREDICTED:
                             evolution.growth_was_predicted = True
 
             evolutions.append(evolution)
@@ -614,23 +798,8 @@ def compare_blade_cracks(cracks_by_face, previous_cracks_by_face, blade):
                 previous_measure_source=measure_source(previous_crack),
             ))
 
+    # Les fissures dont la mesure a baissé ne sont pas remontées du tout.
     return [e for e in evolutions if not (e.size_delta is not None and e.size_delta < 0)]
-
-
-def fetch_crack_data(planification_id, turbine_id):
-    TW_DB_CURSOR.execute(CRACK_QUERY, (planification_id, turbine_id, CRACK_DEFECT_TYPE))
-    return cursor_to_dataframe(TW_DB_CURSOR)
-
-
-def build_cracks_by_face(blade_data):
-    """DataFrame d'une pale -> fissures classées par face, mesures incluses."""
-    if blade_data.empty:
-        return None
-
-    cracks = add_wind_and_size(blade_data)
-    cracks = cracks.join(cracks.apply(get_bounding_box_in_space, axis=1))
-
-    return enrich_cracks_with_measures(group_cracks_by_face(cracks))
 
 
 # =========================================================================== #
@@ -749,6 +918,13 @@ def compute_lateral_spread(by_face):
                     le_section[side] += overlap / le_size
 
 
+def build_blade_erosion(blade_data):
+    """DataFrame d'une pale -> zones érodées et totaux."""
+    if blade_data.empty:
+        return empty_erosion()
+    return build_lee_sections(add_wind_and_size(blade_data))
+
+
 # =========================================================================== #
 # ÉROSION — comparaison
 # =========================================================================== #
@@ -774,13 +950,17 @@ def find_matching_previous_section(section, previous_sections):
 
 
 def classify_erosion_change(size, previous_size):
-    """(status, delta, pourcentage) selon le seuil de 5%."""
+    """(status, delta, pourcentage) selon le seuil de 5%.
+
+    Une érosion ne régresse pas : un delta négatif est un écart de mesure,
+    pas une évolution, et la zone reste "stable".
+    """
     delta = size - previous_size
     percentage = 0.0 if previous_size == 0 else (abs(delta) / previous_size) * 100
 
-    if percentage < LEE_GROWTH_THRESHOLD_PCT:
+    if percentage < LEE_GROWTH_THRESHOLD_PCT or delta <= 0:
         return "stable", delta, percentage
-    return ("grown" if delta > 0 else "shrunk"), delta, percentage
+    return "grown", delta, percentage
 
 
 @dataclass
@@ -790,7 +970,7 @@ class ErodedAreaEvolution:
     blade: str
     radius_start: float
     radius_end: float
-    status: str                        # new / grown / shrunk / stable / repaired
+    status: str                        # new / grown / stable / repaired
     eroded_length: float | None = None
     previous_eroded_length: float | None = None
     length_delta: float | None = None
@@ -812,64 +992,57 @@ class BladeErosionEvolution:
     """Bilan d'une pale : c'est la longueur érodée totale qui fait référence."""
 
     blade: str
-    status: str                        # new / grown / shrunk / stable / repaired
+    status: str                    # new / grown / stable / repaired
     total_eroded_length: float
-    previous_total_eroded_length: float
-    length_delta: float
-    growth_percentage: float
+    previous_total_eroded_length: float 
+    length_delta: float 
+    growth_percentage: float 
 
     eroded_areas_count: int = 0
-    previous_eroded_areas_count: int = 0
+    previous_eroded_areas_count: int = 0 
 
     laminate_length: float = 0.0
-    previous_laminate_length: float = 0.0
+    previous_laminate_length: float = 0.0 
 
     spreads_to_pressure_side: bool = False
     spreads_to_suction_side: bool = False
-    previously_spread_to_pressure_side: bool = False
-    previously_spread_to_suction_side: bool = False
+    previously_spread_to_pressure_side: bool = False 
+    previously_spread_to_suction_side: bool = False 
 
     eroded_areas: list = field(default_factory=list)
 
+@dataclass
+class BladeErosion:
+    """Bilan d'une pale : c'est la longueur érodée totale qui fait référence."""
+    blade: str
+    total_eroded_length: float
 
-def compare_blade_erosion(current, previous, blade, include_areas=True):
-    """Compare le bilan d'érosion d'une pale entre deux campagnes."""
-    sections, total, laminate, nb_ps, nb_ss = current
-    (previous_sections, previous_total, previous_laminate,
-     previous_nb_ps, previous_nb_ss) = previous
+    eroded_areas_count: int = 0
 
-    if total == 0 and previous_total == 0:
-        return None
+    laminate_length: float = 0.0
 
-    if previous_total == 0:
-        status, delta, percentage = "new", total, 100.0
-    elif total == 0:
-        status, delta, percentage = "repaired", -previous_total, 100.0
-    else:
-        status, delta, percentage = classify_erosion_change(total, previous_total)
+    spreads_to_pressure_side: bool = False
+    spreads_to_suction_side: bool = False
 
-    evolution = BladeErosionEvolution(
-        blade=blade,
-        status=status,
-        total_eroded_length=total,
-        previous_total_eroded_length=previous_total,
-        length_delta=delta,
-        growth_percentage=percentage,
-        eroded_areas_count=len(sections),
-        previous_eroded_areas_count=len(previous_sections),
-        laminate_length=laminate,
-        previous_laminate_length=previous_laminate,
-        spreads_to_pressure_side=nb_ps > 0,
-        spreads_to_suction_side=nb_ss > 0,
-        previously_spread_to_pressure_side=previous_nb_ps > 0,
-        previously_spread_to_suction_side=previous_nb_ss > 0,
-    )
+    eroded_areas: list = field(default_factory=list)
+    
+@dataclass
+class ErodedArea:
+    """Une zone érodée du bord d'attaque, comparée à la campagne précédente."""
 
-    if include_areas:
-        evolution.eroded_areas = compare_eroded_areas(sections, previous_sections, blade)
+    blade: str
+    radius_start: float
+    radius_end: float
+    status: str                        # new / grown / stable / repaired
+    eroded_length: float | None = None
 
-    return evolution
+    deepest_part: str | None = None    # Coat / Laminate / LE Tape
+    max_severity: int | None = None
+    wind: str | None = None
 
+
+    spread_pressure_side: float | None = None
+    spread_suction_side: float | None = None
 
 def compare_eroded_areas(sections, previous_sections, blade):
     """Détail zone par zone, apparié par recouvrement de rayons."""
@@ -926,64 +1099,186 @@ def compare_eroded_areas(sections, previous_sections, blade):
     return areas
 
 
-def fetch_erosion_data(planification_id, turbine_id):
-    TW_DB_CURSOR.execute(EROSION_QUERY, (planification_id, turbine_id, LEE_DEFECT_TYPE))
-    return cursor_to_dataframe(TW_DB_CURSOR)
+def compare_blade_erosion(current, previous, blade, include_areas=True):
+    """Compare le bilan d'érosion d'une pale entre deux campagnes."""
+    sections, total, laminate, nb_ps, nb_ss = current
+    (previous_sections, previous_total, previous_laminate,
+     previous_nb_ps, previous_nb_ss) = previous
+
+    if total == 0 and previous_total == 0:
+        return None
+
+    if previous_total == 0:
+        status, delta, percentage = "new", total, 100.0
+    elif total == 0:
+        status, delta, percentage = "repaired", -previous_total, 100.0
+    else:
+        status, delta, percentage = classify_erosion_change(total, previous_total)
+
+    evolution = BladeErosionEvolution(
+        blade=blade,
+        status=status,
+        total_eroded_length=total,
+        previous_total_eroded_length=previous_total,
+        length_delta=delta,
+        growth_percentage=percentage,
+        eroded_areas_count=len(sections),
+        previous_eroded_areas_count=len(previous_sections),
+        laminate_length=laminate,
+        previous_laminate_length=previous_laminate,
+        spreads_to_pressure_side=nb_ps > 0,
+        spreads_to_suction_side=nb_ss > 0,
+        previously_spread_to_pressure_side=previous_nb_ps > 0,
+        previously_spread_to_suction_side=previous_nb_ss > 0,
+    )
+
+    if include_areas:
+        evolution.eroded_areas = compare_eroded_areas(sections, previous_sections, blade)
+
+    return evolution
 
 
-def build_blade_erosion(blade_data):
-    """DataFrame d'une pale -> zones érodées et totaux."""
-    if blade_data.empty:
-        return empty_erosion()
-    return build_lee_sections(add_wind_and_size(blade_data))
+def compute_eroded_areas(sections, blade):
+    """Détail zone par zone, apparié par recouvrement de rayons."""
+    areas = []
+    for section in sections:
+
+        area = ErodedArea(
+            blade=blade,
+            radius_start=section["start"],
+            radius_end=section["end"],
+            eroded_length=section["height"],
+            deepest_part=section["deepest_part"],
+            max_severity=section["max_sev"],
+            wind=section["wind"],
+            spread_pressure_side=section.get("Pressure side"),
+            spread_suction_side=section.get("Suction side"),
+        )
 
 
-# =========================================================================== #
-# Analyses
-# =========================================================================== #
-def analyse_crack_evolution(turbine_id, planification_id, previous_planification_id,
-                            blade=None, only_changed=False):
-    """Compare les fissures des pales entre deux planifications."""
-    full_data = fetch_crack_data(planification_id, turbine_id)
-    previous_full_data = fetch_crack_data(previous_planification_id, turbine_id)
+        areas.append(area)
 
+    return areas
+
+def compute_blade_erosion(current, blade, include_areas=True):
+    """Compare le bilan d'érosion d'une pale entre deux campagnes."""
+    sections, total, laminate, nb_ps, nb_ss = current
+
+    if total == 0:
+        return None
+
+    evolution = BladeErosion(
+        blade=blade,
+        total_eroded_length=total,
+        eroded_areas_count=len(sections),
+        laminate_length=laminate,
+        spreads_to_pressure_side=nb_ps > 0,
+        spreads_to_suction_side=nb_ss > 0,
+    )
+
+    if include_areas:
+        evolution.eroded_areas = compute_eroded_areas(sections, blade)
+
+    return evolution
+
+
+def compare_one_turbine(turbine_id, current_data, previous_data, blade, include_areas):
+    """Compare les pales d'une turbine à partir de DataFrames déjà chargés."""
     evolutions = []
-
-    for current_blade in ([blade] if blade else BLADES):
-        blade_data = select_blade(full_data, current_blade)
-        previous_blade_data = select_blade(previous_full_data, current_blade)
-
-        if blade_data.empty and previous_blade_data.empty:
-            continue
-
-        evolutions.extend(compare_blade_cracks(
-            build_cracks_by_face(blade_data),
-            build_cracks_by_face(previous_blade_data),
-            current_blade,
-        ))
-
-    if only_changed:
-        evolutions = [e for e in evolutions if e.status != "stable"]
-
-    return evolutions
-
-
-def analyse_erosion_evolution(turbine_id, planification_id, previous_planification_id,
-                              blade=None, include_areas=True):
-    """Compare l'érosion du bord d'attaque des pales entre deux planifications."""
-    full_data = fetch_erosion_data(planification_id, turbine_id)
-    previous_full_data = fetch_erosion_data(previous_planification_id, turbine_id)
-
-    evolutions = []
-
     for current_blade in ([blade] if blade else BLADES):
         evolution = compare_blade_erosion(
-            build_blade_erosion(select_blade(full_data, current_blade)),
-            build_blade_erosion(select_blade(previous_full_data, current_blade)),
+            build_blade_erosion(select_blade(current_data, current_blade)),
+            build_blade_erosion(select_blade(previous_data, current_blade)),
             current_blade,
             include_areas,
         )
         if evolution is not None:
             evolutions.append(evolution)
 
-    return evolutions
+    if not evolutions:
+        return None
+    return {"turbine_id": turbine_id, "blades": [asdict(e) for e in evolutions]}
+
+
+def _turbine_frames(turbine_id, current_by_turbine, previous_by_turbine,
+                    current_data_by_planification, previous_data_by_planification):
+    """(données courantes, données précédentes) de cette turbine.
+    OU données courantes de la turbine en fonction de l'appel de fonction"""
+    current_id = current_by_turbine[turbine_id]
+    if previous_by_turbine:
+        previous_id = previous_by_turbine[turbine_id]
+        return (
+            select_turbine(current_data_by_planification[current_id], turbine_id),
+            select_turbine(previous_data_by_planification[previous_id], turbine_id),
+            current_id,
+            previous_id,
+        )
+    else:
+        return (
+            select_turbine(current_data_by_planification[current_id], turbine_id),
+            current_id,
+        )
+
+
+def compare_turbines(turbine_ids, current_by_turbine, previous_by_turbine,
+                                current_data_by_planification,
+                                previous_data_by_planification, blade, include_areas):
+    """Comparaison turbine par turbine.
+
+    Séquentiel volontairement : le SQL est déjà groupé, et le calcul restant est
+    du Python pur — le GIL rend le multithread inutile ici.
+    """
+    payload = []
+    for turbine_id in turbine_ids:
+        current_data, previous_data, current_id, previous_id = _turbine_frames(
+            turbine_id, current_by_turbine, previous_by_turbine,
+            current_data_by_planification, previous_data_by_planification)
+
+        result = compare_one_turbine(turbine_id, current_data, previous_data,
+                                     blade, include_areas)
+        if result is not None:
+            result["planification_id"] = current_id
+            result["previous_planification_id"] = previous_id
+            payload.append(result)
+    return payload
+
+def describe_one_turbine(turbine_id, current_data, blade, include_areas):
+    """État d'érosion des pales d'une turbine, sans comparaison.
+
+    Pendant de compare_one_turbine : même structure de sortie, une seule campagne.
+    """
+    erosions = []
+    for current_blade in ([blade] if blade else BLADES):
+        erosion = compute_blade_erosion(
+            build_blade_erosion(select_blade(current_data, current_blade)),
+            current_blade,
+            include_areas,
+        )
+        # None quand la pale n'a aucune érosion : elle n'apparaît pas.
+        if erosion is not None:
+            erosions.append(erosion)
+
+    if not erosions:
+        return None
+    return {"turbine_id": turbine_id, "blades": [asdict(e) for e in erosions]}
+
+
+def get_current_data_for_turbines(turbine_ids, current_by_turbine,
+                                  current_data_by_planification,
+                                  blade, include_areas):
+    """État d'érosion courant de plusieurs turbines, sans comparaison."""
+    payload = []
+    for turbine_id in turbine_ids:
+        current_data, current_id = _turbine_frames(
+            turbine_id, current_by_turbine, None,
+            current_data_by_planification, None)
+
+        result = describe_one_turbine(turbine_id, current_data, blade, include_areas)
+        if result is not None:
+            result["planification_id"] = current_id
+            payload.append(result)
+    return payload
+
+
+
+###The default one is for Leeding Edge Erosion for VESTAS and cracks fo ENERCON.

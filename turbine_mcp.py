@@ -44,7 +44,7 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
     if model_id is not None:
         req_str += "AND turbines.model_name = %s "; req_optional_params.append(model_id)
     
-    elif avg_type == 'country':
+    if avg_type == 'country':
         req_str += "GROUP BY countries.label_en "
     elif avg_type == 'turbine_model':
         req_str += "GROUP BY models.name "
@@ -71,3 +71,4 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
     
     print("--- RES", res_turbine_count)
     return str(res_turbine_count)
+

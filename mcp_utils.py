@@ -4,6 +4,7 @@ from damage_mcp import *
 from turbine_mcp import *
 
 MAIA_TOOLS = [
+    get_inspection_type_ids,
     get_damage_type_ids,
     get_country_ids_by_name,
     get_turbine_model_ids_by_name,
@@ -19,10 +20,16 @@ MAIA_TOOLS = [
     aep_loss_on_a_site_for_each_turbine,
     aep_loss_on_a_turbine,
     analyse_crack_evolution,
-    analyse_erosion_evolution,
+    # analyse_erosion_evolution,
+    # analyse_erosion,
     
     count_turbines,
     
     get_wind_index_explanation,
-    what_is_new
+    filter_report,
+    singulair_what_s_up,
+    get_site_inspections,
+    get_month_inspections,
+    get_recent_inspections,
+    prioritize_campaign_repair
 ]

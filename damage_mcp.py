@@ -1,3 +1,4 @@
+import json
 from statistics import mean
 
 from langchain_core.tools import tool
@@ -7,12 +8,10 @@ from wind.wind_calculator import WINDCalculator
 from stats_utils import *
 
 from typing import Literal
-import json
 from dataclasses import asdict
 
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from statistics import mean, median
+
 
 @tool
 def get_damage_path(individual_damage_id: int) -> str:
@@ -30,9 +29,16 @@ def get_damage_path(individual_damage_id: int) -> str:
         The path of the image, relative to the inspection images root.'''
     print("TOOL_CALL get_damage_path", individual_damage_id)
     
-    req_str = "SELECT incident_records.path FROM incident_records WHERE incident_records.id = %s "
+    req_str = " \
+        SELECT incident_records.report_path \
+        FROM incident_records \
+        JOIN turbines ON turbines.id = incident_records.turbine_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
+        WHERE incident_records.id = %s \
+    "
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id]
     
-    TW_DB_CURSOR.execute(req_str, (individual_damage_id, ))
+    TW_DB_CURSOR.execute(req_str, req_params)
     for row in TW_DB_CURSOR:
         dmg_img_path = row[0]
     
@@ -76,18 +82,18 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
         JOIN turbines ON turbines.id = incident_records.turbine_id \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         JOIN sites ON sites.id = turbines.site_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
         JOIN countries ON countries.id = sites.country_id \
         JOIN models ON models.id = turbines.model_name \
         WHERE incident_records.dismissed = FALSE AND incident_records.decision_id != 0 AND incident_records.deleted_at IS NULL AND turbines.deleted_at IS NULL AND sites.deleted_at IS NULL \
+        AND incident_records.defect_type_id = %s \
     "
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], damage_type_id]
     
-    req_str += "AND incident_records.defect_type_id = %s "
-    
-    req_optional_params = []
     if country_id is not None:
-        req_str += "AND sites.country_id = %s "; req_optional_params.append(country_id)
+        req_str += "AND sites.country_id = %s "; req_params.append(country_id)
     if model_id is not None:
-        req_str += "AND turbines.model_name = %s "; req_optional_params.append(model_id)
+        req_str += "AND turbines.model_name = %s "; req_params.append(model_id)
     
     if avg_type is None:
         req_str += "GROUP BY incident_records.turbine_id, incident_records.planification_id "
@@ -98,10 +104,8 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
     elif avg_type == 'turbine_age':
         req_str += "GROUP BY incident_records.turbine_id, incident_records.planification_id, turbine_age "
     
-    print("--- REQ", req_str, damage_type_id, req_optional_params)
-    if len(req_optional_params) == 0: TW_DB_CURSOR.execute(req_str, (damage_type_id, ))
-    elif len(req_optional_params) == 1: TW_DB_CURSOR.execute(req_str, (damage_type_id, req_optional_params[0], ))
-    elif len(req_optional_params) == 2: TW_DB_CURSOR.execute(req_str, (damage_type_id, req_optional_params[0], req_optional_params[1], ))
+    print("--- REQ", req_str, req_params)
+    TW_DB_CURSOR.execute(req_str, req_params)
     
     if avg_type is None:
         damage_counts = []
@@ -122,7 +126,7 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
     
     if avg_type is not None:
         for avg_key in raw_damage_counts:
-             damage_counts[avg_key] = mean(raw_damage_counts[avg_key])
+             damage_counts[avg_key] = round(mean(raw_damage_counts[avg_key]), 2)
     
     print("--- RES", damage_counts)
     return str(damage_counts)
@@ -133,41 +137,41 @@ def count_damage_on_a_site_turbines(
 site_id: int, 
 location_precision: Literal["turbine", "blade", "face", "radius"],
 damage_aggregations: list[DamageAggregation],
-planification_id: int | None = None,
+inspection_id: int | None = None,
 damage_type_id: int | None = None, severities: list[int] | None = None,
 turbine_ids: list[int] | None = None,
 ) -> str:
-    '''Count damages of a given type on each individual turbine of one site.
+    '''Show or summarize damages on a site, per turbine (or blade/face if requested).
 
+    Use this when the user asks to see, show, list, or compare damages on a site;
     Use this when the answer must name specific turbines, or to follow how damages evolved over time on a site. 
     For aggregate figures across several sites, countries or turbine models, use count_damage_on_turbines instead.
     
-    A planification is an inspection campaign carried out on the site at a given date.
+    An inspection is an inspection campaign carried out on the site at a given date.
     If location_precision is radius you must filter on a damage type with damage_type_id.
     
     Args:
         site_id: The site whose turbines are counted.
         
         location_precision: Specify how finely damages are located in the result: 
-            one row per turbine, per blade, or per blade face.
+            one row per turbine, per blade, per blade face, or by radius.
         damage_aggregations: Specify which characteristics split damages into separate
             counts. Pass an empty list for a single total per location. "blade_component"
             groups by the component of the blade affected (coat, laminate, lightning receptor...),
             which is independent of location_precision.
-        planification_id: Restrict the result to a single planification. If omitted, every planification recorded for this site is returned.
+        inspection_id: Restrict the result to a single inspection. If omitted, every inspection recorded for this site is returned.
         damage_type_id: Restrict to one damage type.
         severities: Restrict to some severities. Can be combined with damage_type_id.
-        turbine_ids: Restricts the result to some turbines. When left empty, every damaged turbine of the planification is returned.
+        turbine_ids: Restricts the result to some turbines. When left empty, every damaged turbine of the inspection is returned.
 
     Returns:
-        One PlanificationDamageCountResult per campaign, each holding the planification
+        One InspectionDamageCountResult per campaign, each holding the inspection
         date (YYYY-mm-dd) and one row per location at the requested precision. Every row
         carries the turbine name, the blade and face when
         applicable, the value of each requested aggregation, and the damage count.
         Turbines with no damage don't appear.'''
-    print("TOOL_CALL count_damage_on_a_site_turbines", site_id, location_precision, damage_aggregations, planification_id, damage_type_id, severities, turbine_ids)
+    print("TOOL_CALL count_damage_on_a_site_turbines", site_id, location_precision, damage_aggregations, inspection_id, damage_type_id, severities, turbine_ids)
     
-    req_params = [site_id]
     req_str = "SELECT planifications.id AS planif_id, CAST(planifications.date AS VARCHAR) AS planif_date, turbines.id AS turbine_id, turbines.name AS turbine_name, "
     
     if location_precision == 'blade': req_str += "components_turbines.name AS blade, "
@@ -183,7 +187,9 @@ turbine_ids: list[int] | None = None,
         FROM incident_records \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
     "
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID']]
     
     if location_precision in ['blade', 'face', 'radius']: req_str += "JOIN components_turbines ON components_turbines.id = incident_records.component_turbine_id "
     if location_precision in ['face', 'radius']: req_str += "JOIN parts ON parts.id = incident_records.part_id "
@@ -195,9 +201,10 @@ turbine_ids: list[int] | None = None,
         WHERE incident_records.dismissed = FALSE AND incident_records.decision_id != 0 AND incident_records.deleted_at IS NULL AND turbines.deleted_at IS NULL AND planifications.deleted_at IS NULL \
             AND turbines.site_id = %s \
     "
+    req_params.append(site_id)
     
-    if planification_id is not None:
-        req_str += "AND incident_records.planification_id = %s "; req_params.append(planification_id)
+    if inspection_id is not None:
+        req_str += "AND incident_records.planification_id = %s "; req_params.append(inspection_id)
     if damage_type_id is not None:
         req_str += "AND incident_records.defect_type_id = %s "; req_params.append(damage_type_id)
         
@@ -230,31 +237,34 @@ turbine_ids: list[int] | None = None,
     TW_DB_CURSOR.execute(req_str, req_params)
     
     damage_counts = []
-    found_planification_id = []
-    found_planif_turbine_id = []
+    found_inspection_id = []
+    found_insp_turbine_id = []
     
     if damage_type_id is None and severities is None: damage_count_filter = "Count all damages"
     elif damage_type_id is not None and severities is None: damage_count_filter = "Only count damage_type_id = " + str(damage_type_id)
     elif damage_type_id is None and severities is not None: damage_count_filter = "Only count severities in " + str(severities)
     elif damage_type_id is not None and severities is not None: damage_count_filter = "Only count damage_type_id = " + str(damage_type_id) + " and severity = " + str(severity)
     
-    dmg_count_cpt = 0
+    dmg_count_group_cpt = 0
     
     req_columns = [col[0] for col in TW_DB_CURSOR.description]
     for row in TW_DB_CURSOR:
         record = dict(zip(req_columns, row))
         if 'severity' in record and record['severity'] == 6: record['severity'] = 0
         
-        if record['planif_id'] not in found_planification_id:
-            found_planification_id.append(record['planif_id'])
-            damage_counts.append(PlanificationDamageCountResult(
-                planification=Planification(id=record['planif_id'], date=record['planif_date']),
+        if record['planif_id'] not in found_inspection_id:
+            found_inspection_id.append(record['planif_id'])
+            damage_counts.append(InspectionDamageCountResult(
+                inspection=Inspection(
+                    id=record['planif_id'], 
+                    date=record['planif_date'],
+                    published_date=str(get_publish_date(record['planif_id']))),
                 turbine_damage_counts=[]
             ))
-            found_planif_turbine_id = []
+            found_insp_turbine_id = []
         
-        if record['turbine_id'] not in found_planif_turbine_id:
-            found_planif_turbine_id.append(record['turbine_id'])
+        if record['turbine_id'] not in found_insp_turbine_id:
+            found_insp_turbine_id.append(record['turbine_id'])
             damage_counts[-1].turbine_damage_counts.append(TurbineDamageCountResult(
                 turbine=Turbine(id=record['turbine_id'], name=record['turbine_name']),
                 damage_count_filter=damage_count_filter,
@@ -272,9 +282,9 @@ turbine_ids: list[int] | None = None,
             severity=record.get('severity'),
             damage_count=record['damage_count']
         ))
-        dmg_count_cpt += 1
+        dmg_count_group_cpt += 1
         
-    if dmg_count_cpt > 50:
+    if dmg_count_group_cpt > 100:
         resp = "There is too much data to analyse.\n"
         if damage_type_id == None or severities == None:
             resp += "If you can, use the damage filter parameters (damage_type_id, severities) to reduce the data.\n"
@@ -282,33 +292,33 @@ turbine_ids: list[int] | None = None,
             resp += "You can propose to the user to use a less precise location than." + location_precision + "\n"
         if turbine_ids == None:
             resp += "You can propose to the user to look at a specific turbine.\n"
-        print("--- RES", resp)
-        return str(resp)
+        print("--- RES", resp); return resp
     
     print("--- RES", damage_counts)
     return str(damage_counts)
 
+# TODO prendre en compte si la turbine est Approved ou non
 @tool
 def estimate_repair_cost(
-planification_id: int,
+inspection_id: int,
 turbine_id: int | None = None,
 damage_type_id: int | None = None,
 ) -> str:
-    '''Estimate the cost of repairing the damages reported at one planification.
+    '''Estimate the cost of repairing the damages reported at one inspection.
     
-    Covers a single planification of a single site.
+    Covers a single inspection of a single site.
     
     Args:
-        planification_id: Required. The inspection whose damages are priced.
+        inspection_id: The inspection whose damages are priced.
         turbine_id: Restrict the estimate to one turbine of that site.
         damage_type_id: Restrict the estimate to one damage type.
         
     Returns:
-        A list of TurbineRepairCost, one per turbine. Each turbine holds its
+        A list of TurbineRepairCost, one per turbine with damage to repair. Each turbine holds its
         damages grouped by (severity, damage type), with the number of damages in
         the group and the estimated repair cost for that group, in USD. No overall
         total is provided — sum the groups if needed.'''
-    print("TOOL_CALL estimate_repair_cost", planification_id, turbine_id, damage_type_id)
+    print("TOOL_CALL estimate_repair_cost", inspection_id, turbine_id, damage_type_id)
     
     general_cost_by_sev = {}
     TW_DB_CURSOR.execute("SELECT * FROM sesame_damage_general_cost")
@@ -327,33 +337,34 @@ damage_type_id: int | None = None,
             damage_cost_coef_max_count = count
         
     req_str = " \
-        SELECT turbines.id, turbines.name, incident_records.defect_type_id, incident_records.criticality_id, COUNT(*) \
+        SELECT turbines.id, turbines.name, defect_types.id, defect_types.label_en, incident_records.criticality_id, COUNT(*) \
         FROM incident_records \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
+        JOIN defect_types ON defect_types.id = incident_records.defect_type_id \
         WHERE incident_records.planification_id = %s \
     "
     
-    req_optional_params = []
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], inspection_id]
+    
     if turbine_id is not None:
-        req_str += "AND incident_records.turbine_id = %s "; req_optional_params.append(turbine_id)
+        req_str += "AND incident_records.turbine_id = %s "; req_params.append(turbine_id)
     if damage_type_id is not None:
-        req_str += "AND incident_records.defect_type_id = %s "; req_optional_params.append(damage_type_id)
+        req_str += "AND incident_records.defect_type_id = %s "; req_params.append(damage_type_id)
         
     req_str += " \
-        GROUP BY turbines.id, turbines.name, incident_records.defect_type_id, incident_records.criticality_id \
+        GROUP BY turbines.id, turbines.name, defect_types.id, defect_types.label_en, incident_records.criticality_id \
         ORDER BY turbines.id \
     "
     
-    print("--- REQ", req_str, planification_id, req_optional_params)
-    if len(req_optional_params) == 0: TW_DB_CURSOR.execute(req_str, (planification_id, ))
-    elif len(req_optional_params) == 1: TW_DB_CURSOR.execute(req_str, (planification_id, req_optional_params[0], ))
-    elif len(req_optional_params) == 2: TW_DB_CURSOR.execute(req_str, (planification_id, req_optional_params[0], req_optional_params[1], ))
+    print("--- REQ", req_str, req_params)
+    TW_DB_CURSOR.execute(req_str, req_params)
     
     turbine_repair_costs = []
     found_turbine_id = []
     for row in TW_DB_CURSOR:
-        turbine_id, turbine_name, row_damage_type_id, severity_id, damage_count = row
+        turbine_id, turbine_name, row_damage_type_id, damage_type, severity_id, damage_count = row
         true_severity = severity_id
         if true_severity == 6: true_severity = 0
         
@@ -364,7 +375,7 @@ damage_type_id: int | None = None,
             repair_cost = general_cost_by_sev[severity_id] * damage_cost_coefs[coef_damage_count]
             
             explanation = "The base cost for this damage severity is " + str(general_cost_by_sev[severity_id])
-            explanation += " and since there is " + str(damage_count) + "damage it's multiplied by " + str(damage_cost_coefs[coef_damage_count])
+            explanation += " and since there is " + str(damage_count) + " damage it's multiplied by " + str(damage_cost_coefs[coef_damage_count])
             
             if turbine_id not in found_turbine_id:
                 found_turbine_id.append(turbine_id)
@@ -375,7 +386,7 @@ damage_type_id: int | None = None,
             
             turbine_repair_costs[-1].damage_group_repair_cost.append(DamageGroupRepairCost(
                 severity=true_severity,
-                damage_type_id=row_damage_type_id,
+                damage_type=DamageType(id=row_damage_type_id, name=damage_type),
                 damage_count=damage_count,
                 repair_cost=repair_cost,
                 explanation=explanation
@@ -411,12 +422,15 @@ def get_individual_damage_infos(individual_damage_id: int) -> str:
         JOIN components_turbines ON components_turbines.id = incident_records.component_turbine_id  \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
         JOIN sites ON sites.id = turbines.site_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         WHERE incident_records.id = %s \
     "
-    print("--- REQ", req_str, individual_damage_id)
     
-    TW_DB_CURSOR.execute(req_str, (individual_damage_id, ))
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id]
+    
+    print("--- REQ", req_str, req_params)
+    TW_DB_CURSOR.execute(req_str, req_params)
     for row in TW_DB_CURSOR:
         dmg_id, part_dmgd_id, part_dmgd, dmg_type_id, dmg_type, sev_id, site_id, site, turbine_id, turbine, blade, face, radius, planif_id, planif_date, wind, wind_severity, wind_desc, wind_new_desc, wind_new_sev = row
 
@@ -431,8 +445,10 @@ def get_individual_damage_infos(individual_damage_id: int) -> str:
         blade=blade,
         face=face,
         radius=radius,
-        planification=Planification(id=planif_id, date=planif_date),
-        wind=wind_calculator.getDmgWIND({"wind":wind, "wind_severity":wind_severity, "wind_desc":wind_desc, "wind_new_desc":wind_new_desc, "wind_new_sev":wind_new_sev})
+        inspection=Inspection(
+            id=planif_id, date=planif_date, published_date=str(get_publish_date(planif_id))
+        ),
+        wind=wind_calculator.getDmgWIND({"wind": wind, "wind_severity": wind_severity, "wind_desc": wind_desc, "wind_new_desc": wind_new_desc, "wind_new_sev": wind_new_sev})
     )
     
     print("--- RES", damage_infos)
@@ -465,11 +481,14 @@ def estimate_damage_repair_frequency(individual_damage_id) -> str:
         incident_records.part_id, incident_records.radius, turbines.model_name \
         FROM incident_records \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
         WHERE incident_records.id = %s \
     "
-    print("--- REQ", req_str, individual_damage_id)
     
-    TW_DB_CURSOR.execute(req_str, (individual_damage_id, ))
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id]
+    
+    print("--- REQ", req_str, req_params)
+    TW_DB_CURSOR.execute(req_str, req_params)
     for row in TW_DB_CURSOR:
         part_damaged_id, damage_type_id, severity_id, face_id, radius, model_id = row
     
@@ -479,14 +498,18 @@ def estimate_damage_repair_frequency(individual_damage_id) -> str:
         SELECT incident_records.id, turbine_id, planification_id \
         FROM incident_records \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
         WHERE incident_records.id  <> %s \
         AND incident_records.component_id = %s AND incident_records.defect_type_id = %s AND incident_records.criticality_id = %s \
         AND incident_records.part_id = %s AND incident_records.radius = %s AND turbines.model_name = %s \
     "
-    print("--- REQ", req_str, individual_damage_id, part_damaged_id, damage_type_id, severity_id, face_id, radius, model_id)
+    
+    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id, part_damaged_id, damage_type_id, severity_id, face_id, radius, model_id]
+    
+    print("--- REQ", req_str, req_params)
+    TW_DB_CURSOR.execute(req_str, req_params)
     
     similar_damages = []
-    TW_DB_CURSOR.execute(req_str, (individual_damage_id, part_damaged_id, damage_type_id, severity_id, face_id, radius, model_id, ))
     for row in TW_DB_CURSOR:
         similar_id, similar_turbine_id, similar_planification_id = row
         similar_damages.append({'id': similar_id, 'turbine_id': similar_turbine_id, 'planification_id': similar_planification_id})
@@ -525,22 +548,17 @@ BLADE_LAYOUT = {
     "C": ["A", "B"],
 }
 
-# Avec un curseur unique partagé, monter ce nombre ne parallélise rien et ajoute
-# de la contention. Commencer à 1, puis 2, 4, 8 en chronométrant.
-AEP_MAX_WORKERS = 4
-
-
 @tool
 def aep_loss_on_a_site_for_each_turbine(site_id: int,
-                                        planification_id: int | None = None,
-                                        aep_loss_blade_needed: bool = False,
-                                        criticality: int | None = None) -> str:
+inspection_id: int | None = None,
+aep_loss_blade_needed: bool = False,
+criticality: int | None = None) -> str:
     '''Get the AEP (Annual Energy Production) loss of a site and of each of its turbines.
 
     Use this when the user asks how much energy a site is losing, which turbines
-    are losing the most, or wants to compare turbines within a site. This also
-    covers questions about one specific turbine or a subset of turbines: call the
-    tool with the site, then read the turbines you need from the returned list.
+    are losing the most, or wants to compare turbines within a site. For a question
+    about a single named turbine, call aep_loss_on_a_turbine instead: it computes
+    only that turbine and is much cheaper.
 
     Set aep_loss_blade_needed=True only when the question is about blades: which
     blade drives a turbine's loss, or how much would be recovered by repairing it.
@@ -550,12 +568,11 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
     Losses are computed with the Jensen wake model.
 
     Args:
-        site_id: Identifier of the site. Use list_sites to resolve a site name
-            into its id.
-        planification_id: Optional. Restricts the figures to one planification.
-            When omitted, the most recent planification available for that site
+        site_id: Identifier of the site. Use get_sites to resolve a site name into its id.
+        inspection_id: Optional. Restricts the figures to one inspection.
+            When omitted, the most recent inspection available for that site
             is used, which is what you want unless the user explicitly asks about
-            an older planification.
+            an older inspection.
         aep_loss_blade_needed: Optional, default False. Adds a per-blade breakdown 
             (blades A, B and C) to every turbine. Slow — only set it True when the
             user asks about blades specifically.
@@ -571,7 +588,7 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
             the level 4 damages?"
 
     Returns:
-        A SiteAEPLoss object with the site (id and name), the planification the
+        A SiteAEPLoss object with the site (id and name), the inspection the
         figures come from (id and date), the total AEP loss of the site, and
         aep_loss_turbines: one TurbineAEPLoss per turbine, each carrying the
         turbine id and name and its own AEP loss. When aep_loss_blade_needed is
@@ -580,16 +597,16 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
         given.
     '''
     print("TOOL_CALL aep_loss_on_a_site_for_each_turbine",
-          site_id, planification_id, aep_loss_blade_needed, criticality)
+          site_id, inspection_id, aep_loss_blade_needed, criticality)
 
     # ------------------------------------------------------------------ #
-    # 1. Résolution de la planification
+    # 1. Résolution de l'inspection
     #
     # On la résout AVANT la requête principale : les appels imbriqués à
-    # get_aep_loss_turbine doivent porter sur la même planification que les
+    # get_aep_loss_turbine doivent porter sur la même inspection que les
     # chiffres du site, sinon le détail par pale ne correspond pas au total.
     # ------------------------------------------------------------------ #
-    if planification_id is None:
+    if inspection_id is None:
         TW_DB_CURSOR.execute(
             "SELECT MAX(planification_id) FROM aep_loss WHERE site_id = %s",
             (site_id,),
@@ -600,7 +617,7 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
         if resolved_planification_id is None:
             return "ERROR: no AEP loss data for this site"
     else:
-        resolved_planification_id = planification_id
+        resolved_planification_id = inspection_id
 
     # ------------------------------------------------------------------ #
     # 2. Chiffres par turbine
@@ -640,53 +657,32 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
         tasks = []
         for turbine_id in turbine_ids:
             for blade, not_blades in BLADE_LAYOUT.items():
-                tasks.append((turbine_id, blade, not_blades, None))
+                blade_results[(turbine_id, blade, False)] = get_aep_loss_turbine(
+                    site_id=site_id,
+                    planification_id=resolved_planification_id,
+                    turbine_id=turbine_id,
+                    not_blades=not_blades,
+                    criticality_id=None,
+                )["AEP_loss_Jensen"]
+ 
                 if criticality is not None:
-                    tasks.append((turbine_id, blade, not_blades, criticality))
-
-        workers = min(AEP_MAX_WORKERS, len(tasks))
-        print(f"--- AEP {len(rows)} lignes, {len(turbine_ids)} turbines, "
-              f"{len(tasks)} calculs, {workers} threads")
-
-        timings = []
-        timings_lock = threading.Lock()
-
-        def run_blade_task(task):
-            turbine_id, blade, not_blades, crit = task
-            started = time.time()
-            result = get_aep_loss_turbine(
-                site_id=site_id,
-                planification_id=resolved_planification_id,
-                turbine_id=turbine_id,
-                not_blades=not_blades,
-                criticality_id=crit,
-            )
-            with timings_lock:
-                timings.append(time.time() - started)
-            return (turbine_id, blade, crit is not None), result["AEP_loss_Jensen"]
-
-        wall_start = time.time()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for key, value in pool.map(run_blade_task, tasks):
-                blade_results[key] = value
-
-        wall = time.time() - wall_start
-        cumul = sum(timings)
-        # Gain proche de x1 : aucun parallélisme réel (GIL ou curseur partagé).
-        # Dans ce cas, baisser AEP_MAX_WORKERS ne coûte rien et réduit la contention.
-        print(f"--- AEP {len(timings)} calculs — cumul {cumul:.1f}s — "
-              f"mur {wall:.1f}s — moyenne {cumul / len(timings):.2f}s — "
-              f"gain x{cumul / wall:.1f}")
-
+                    blade_results[(turbine_id, blade, True)] = get_aep_loss_turbine(
+                        site_id=site_id,
+                        planification_id=resolved_planification_id,
+                        turbine_id=turbine_id,
+                        not_blades=not_blades,
+                        criticality_id=criticality,
+                    )["AEP_loss_Jensen"]
+ 
     # ------------------------------------------------------------------ #
     # 4. Construction du résultat
     # ------------------------------------------------------------------ #
     aep_loss_turbines = []
     aep_loss_site = 0.0
     site_name = ""
-    planification_date = ""
+    inspection_date = ""
 
-    for turbine_id, aep_loss_jensen, turbine_name, site_name, planification_date in rows:
+    for turbine_id, aep_loss_jensen, turbine_name, site_name, inspection_date in rows:
         blade_aep_loss = None
         if aep_loss_blade_needed:
             blade_aep_loss = [
@@ -709,8 +705,9 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
 
     result = SiteAEPLoss(
         site=Site(id=site_id, name=str(site_name)),
-        planification=Planification(id=resolved_planification_id,
-                                    date=str(planification_date)),
+        inspection=Inspection(
+            id=resolved_planification_id, published_date=str(get_publish_date(resolved_planification_id))
+        ),
         aep_loss_site=aep_loss_site,
         aep_loss_turbines=aep_loss_turbines,
     )
@@ -719,9 +716,9 @@ def aep_loss_on_a_site_for_each_turbine(site_id: int,
 
 @tool
 def aep_loss_on_a_turbine(turbine_id: int,
-                          planification_id: int | None = None,
-                          aep_loss_blade_needed: bool = False,
-                          criticality: int | None = None) -> str:
+inspection_id: int | None = None,
+aep_loss_blade_needed: bool = False,
+criticality: int | None = None) -> str:
     '''Get the AEP (Annual Energy Production) loss of one single turbine.
 
     Use this whenever the question is about one turbine — how much energy it is
@@ -737,10 +734,10 @@ def aep_loss_on_a_turbine(turbine_id: int,
         turbine_id: Identifier of the turbine. Use list_turbines or the site tool
             to resolve a turbine name like "T01" into its id, since turbine names
             repeat across sites.
-        planification_id: Optional. Restricts the figures to one planification.
-            When omitted, the most recent planification available for that turbine
+        inspection_id: Optional. Restricts the figures to one inspection.
+            When omitted, the most recent inspection available for that turbine
             is used, which is what you want unless the user explicitly asks about
-            an older planification.
+            an older inspection.
         aep_loss_blade_needed: Optional, default False. Adds the per-blade
             breakdown (blades A, B and C). It runs three extra computations, so
             leave it False when the turbine total is enough.
@@ -754,22 +751,22 @@ def aep_loss_on_a_turbine(turbine_id: int,
             repaired. Requires aep_loss_blade_needed=True; ignored otherwise.
 
     Returns:
-        The site and the planification the figures come from, and a TurbineAEPLoss
+        The site and the inspection the figures come from, and a TurbineAEPLoss
         with the turbine id, its name and its AEP loss. When aep_loss_blade_needed
         is True, it also carries blade_aep_loss: one BladeAEPLoss per blade with
         its individual loss, plus the post-repair loss when criticality was given.
     '''
     print("TOOL_CALL aep_loss_on_a_turbine",
-          turbine_id, planification_id, aep_loss_blade_needed, criticality)
+          turbine_id, inspection_id, aep_loss_blade_needed, criticality)
 
     # ------------------------------------------------------------------ #
-    # 1. Résolution de la planification
+    # 1. Résolution de la inspection
     #
     # Résolue avant tout : les appels à get_aep_loss_turbine doivent porter sur
-    # la même planification que le chiffre affiché, sinon le détail par pale ne
+    # la même inspection que le chiffre affiché, sinon le détail par pale ne
     # correspond pas au total de la turbine.
     # ------------------------------------------------------------------ #
-    if planification_id is None:
+    if inspection_id is None:
         TW_DB_CURSOR.execute(
             "SELECT MAX(planification_id) FROM aep_loss WHERE turbine_id = %s",
             (turbine_id,),
@@ -780,7 +777,7 @@ def aep_loss_on_a_turbine(turbine_id: int,
         if resolved_planification_id is None:
             return "ERROR: no AEP loss data for this turbine"
     else:
-        resolved_planification_id = planification_id
+        resolved_planification_id = inspection_id
 
     # ------------------------------------------------------------------ #
     # 2. Chiffre de la turbine
@@ -801,10 +798,9 @@ def aep_loss_on_a_turbine(turbine_id: int,
     row = TW_DB_CURSOR.fetchone()
 
     if row is None:
-        return "ERROR: no AEP loss data for this turbine at this planification"
+        return "ERROR: no AEP loss data for this turbine at this inspection"
 
-    (turbine_id, aep_loss_jensen, turbine_name,
-     site_id, site_name, planification_date) = row
+    (turbine_id, aep_loss_jensen, turbine_name, site_id, site_name, planification_date) = row
 
     # ------------------------------------------------------------------ #
     # 3. Détail par pale
@@ -819,7 +815,7 @@ def aep_loss_on_a_turbine(turbine_id: int,
         for blade, not_blades in BLADE_LAYOUT.items():
             current = get_aep_loss_turbine(
                 site_id=site_id,
-                planification_id=resolved_planification_id,
+                inspection_id=resolved_planification_id,
                 turbine_id=turbine_id,
                 not_blades=not_blades,
                 criticality_id=None,
@@ -829,7 +825,7 @@ def aep_loss_on_a_turbine(turbine_id: int,
             if criticality is not None:
                 repaired = get_aep_loss_turbine(
                     site_id=site_id,
-                    planification_id=resolved_planification_id,
+                    inspection_id=resolved_planification_id,
                     turbine_id=turbine_id,
                     not_blades=not_blades,
                     criticality_id=criticality,
@@ -847,74 +843,62 @@ def aep_loss_on_a_turbine(turbine_id: int,
     turbine_result = TurbineAEPLoss(
         turbine=Turbine(id=turbine_id, name=turbine_name),
         blade_aep_loss=blade_aep_loss,
-        aep_loss=aep_loss_jensen,
+        aep_loss=round(aep_loss_jensen,2),
     )
 
     return json.dumps({
         "site": Site(id=site_id, name=str(site_name)).model_dump(),
-        "planification": Planification(id=resolved_planification_id,
-                                       date=str(planification_date)).model_dump(),
+        "inspection": Inspection(
+            id=resolved_planification_id, published_date=str(get_publish_date(resolved_planification_id))
+        ).model_dump(),
         "turbine": turbine_result.model_dump(),
     }, default=str)
 
 @tool
 def analyse_crack_evolution(turbine_id: int,
-                            planification_id: int,
-                            previous_planification_id: int | None = None,
-                            blade: str | None = None,
-                            only_changed: bool = False) -> str:
+inspection_id: int,
+previous_inspection_id: int | None = None,
+blade: str | None = None,
+only_changed: bool = False) -> str:
     '''Tell how the cracks of a turbine evolved between two inspection campaigns.
  
     Use this when the user asks whether a crack grew, whether damages got worse
     on a turbine, what changed since the last inspection, or which cracks were
-    repaired. Each crack of the current campaign is matched to its counterpart in
-    the previous one by physical position on the blade, so a crack keeps its
-    identity even when its damage id changes between campaigns.
- 
-    Growth is only reported as significant when it exceeds a statistical
-    threshold that depends on the crack's previous size, from 50.6% for cracks
-    under 30mm down to 11.9% above 250mm. Below that, measurement noise cannot be
-    told apart from real growth, and the crack is reported as stable.
+    repaired.
  
     Args:
-        turbine_id: Identifier of the turbine to analyse. Required.
-        planification_id: The campaign to look at. Required — this tool never
-            picks a campaign on its own. If the user did not name one, resolve it
-            first: use the campaign from the page context when there is one, or
-            list the turbine's campaigns and take the most recent, or ask the
-            user which campaign they mean.
-        previous_planification_id: Optional. The campaign to compare against.
-            When omitted, the campaign right before planification_id is used.
-            This is the normal case: pass it only when the user asks to compare
-            with a specific older campaign.
+        turbine_id: Identifier of the turbine to analyse.
+        inspection_id: The campaign to look at.
+        previous_inspection_id: Optional. The campaign to compare against.
+            When omitted, the campaign right before inspection_id is used.
         blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
-        only_changed: Optional, default False. Set True to drop unchanged cracks
-            and keep only what is new, grown, shrunk or repaired — useful when
-            the user asks "what changed" rather than for a full picture.
+        only_changed: Set True to drop unchanged cracks
+            and keep only what is new, grown or repaired.
  
     Returns:
         The two campaigns compared, and one entry per crack with its blade, face,
         radius, shape, severity and WIND index, its current and previous size in
-        meters, and a status: new (absent before), grown, shrunk, stable, or
-        repaired (present before, gone now). Sizes are lengths in meters, except
-        for multibranched and stripes cracks which are areas in square meters and
-        are not compared. Each entry also states whether its size comes from a
-        manual measurement or from the image: a delta between two different
-        sources is not reliable. growth_was_predicted marks a crack whose WIND
-        index had already forecast the growth.
+        meters, and a status: new (absent before), grown, stable, or repaired
+        (present before, gone now).
+
+        Sizes are lengths in meters, except for multibranched and stripes cracks
+        which are areas in square meters and are not compared. Each entry also
+        states whether its size comes from a manual measurement or from the image:
+        a delta between two different sources is not reliable. growth_was_predicted
+        marks a crack whose WIND index had already forecast the growth.
     '''
-    print("TOOL_CALL analyse_crack_evolution", turbine_id, planification_id,
-          previous_planification_id, blade, only_changed)
+    print("TOOL_CALL analyse_crack_evolution", turbine_id, inspection_id,
+          previous_inspection_id, blade, only_changed)
  
-    if previous_planification_id is None:
-        previous_planification_id = resolve_previous_planification(
-            turbine_id, planification_id)
-        if previous_planification_id is None:
-            return ("ERROR: no earlier inspection campaign with damages for this turbine, "
-                    "there is nothing to compare with")
+    if previous_inspection_id is None:
+        previous_inspection_id = resolve_previous_planification(turbine_id, inspection_id)
+        if previous_inspection_id is None:
+            res = "ERROR: no earlier inspection campaign with damages for this turbine, there is nothing to compare with"
+            print(res)
+            return res
  
-    full_data = fetch_crack_data(planification_id, turbine_id)
-    previous_full_data = fetch_crack_data(previous_planification_id, turbine_id)
+    full_data = fetch_crack_data(inspection_id, turbine_id)
+    previous_full_data = fetch_crack_data(previous_inspection_id, turbine_id)
  
     evolutions = []
  
@@ -925,6 +909,7 @@ def analyse_crack_evolution(turbine_id: int,
         if blade_data.empty and previous_blade_data.empty:
             continue
  
+        #TODO vérifier si les cracks qui ont "rétrécis" sont remontés ou pas, c'est pas clair
         evolutions.extend(compare_blade_cracks(
             build_cracks_by_face(blade_data),
             build_cracks_by_face(previous_blade_data),
@@ -934,104 +919,319 @@ def analyse_crack_evolution(turbine_id: int,
     if only_changed:
         evolutions = [e for e in evolutions if e.status != "stable"]
  
-    return json.dumps({
+    #TODO mettre toutes les infos
+    res = json.dumps({
         "turbine_id": turbine_id,
-        "planification_id": planification_id,
-        "previous_planification_id": previous_planification_id,
+        "inspection_id": inspection_id,
+        "previous_inspection_id": previous_inspection_id,
         "cracks": [asdict(e) for e in evolutions],
     }, default=str)
  
- 
-@tool
-def analyse_erosion_evolution(turbine_id: int,
-                              planification_id: int,
-                              previous_planification_id: int | None = None,
-                              blade: str | None = None,
-                              include_areas: bool = True) -> str:
-    '''Tell how the leading edge erosion of a turbine evolved between two inspection campaigns.
- 
-    Use this when the user asks whether erosion progressed, got worse, spread, or
-    whether a blade is eroding faster than the others. Erosion is measured as the
-    total eroded length along the leading edge of each blade, in meters, and that
-    blade total is the reliable figure — unlike cracks, an eroded zone has no
-    stable identity from one campaign to the next, since zones merge and split as
-    erosion spreads.
- 
-    A change is only reported as significant when the eroded length varies by
-    more than 5%. Below that, the difference cannot be told apart from
-    measurement variation, and the blade is reported as stable.
- 
-    All severities are included: this tool describes the full extent of the
-    erosion, not only the severe parts.
- 
-    Args:
-        turbine_id: Identifier of the turbine to analyse. Required.
-        planification_id: The campaign to look at. Required — this tool never
-            picks a campaign on its own. If the user did not name one, resolve it
-            first: use the campaign from the page context when there is one, or
-            list the turbine's campaigns and take the most recent, or ask the
-            user which campaign they mean.
-        previous_planification_id: Optional. The campaign to compare against.
-            When omitted, the campaign right before planification_id is used,
-            which is the normal case. Pass it only when the user asks to compare
-            with a specific older campaign.
-        blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
-        include_areas: Optional, default True. Set False to get only the blade
-            totals and skip the zone-by-zone breakdown — enough to answer "did
-            erosion get worse", and a much shorter answer.
- 
-    Returns:
-        The two campaigns compared, and one entry per eroded blade with:
-        - total_eroded_length and previous_total_eroded_length, in meters along
-          the leading edge, plus the delta and the percentage of change
-        - status: new (no erosion before), grown, shrunk, stable, or repaired
-          (erosion before, none now)
-        - eroded_areas_count: how many separate eroded zones, then and now. A
-          count that drops while the length grows means zones merged, not that
-          erosion receded
-        - laminate_length: how much of the erosion reached the laminate rather
-          than only the coat. This is the depth of the erosion, and it drives the
-          repair method
-        - spreads_to_pressure_side and spreads_to_suction_side, with their
-          previous values: erosion spreading sideways off the leading edge is a
-          change of nature, not just of size
-        When include_areas is True, each blade also carries eroded_areas: one
-        entry per zone with its radius range, eroded length then and now, deepest
-        damaged part, max severity, WIND index, and how far it spreads onto each
-        side. Zones are matched across campaigns by radius overlap, so treat
-        their individual status as indicative and the blade total as the answer.
-        growth_was_predicted marks a zone whose WIND index had already forecast
-        the worsening.
-        A blade with no erosion in either campaign does not appear at all.
-    '''
-    print("TOOL_CALL analyse_erosion_evolution", turbine_id, planification_id,
-          previous_planification_id, blade, include_areas)
- 
-    if previous_planification_id is None:
-        previous_planification_id = resolve_previous_planification(
-            turbine_id, planification_id)
-        if previous_planification_id is None:
-            return ("ERROR: no earlier inspection campaign with damages for this turbine, "
-                    "there is nothing to compare with")
- 
-    full_data = fetch_erosion_data(planification_id, turbine_id)
-    previous_full_data = fetch_erosion_data(previous_planification_id, turbine_id)
- 
-    evolutions = []
- 
-    for current_blade in ([blade] if blade else BLADES):
-        evolution = compare_blade_erosion(
-            build_blade_erosion(select_blade(full_data, current_blade)),
-            build_blade_erosion(select_blade(previous_full_data, current_blade)),
-            current_blade,
-            include_areas,
-        )
-        if evolution is not None:
-            evolutions.append(evolution)
- 
-    return json.dumps({
-        "turbine_id": turbine_id,
-        "planification_id": planification_id,
-        "previous_planification_id": previous_planification_id,
-        "blades": [asdict(e) for e in evolutions],
-    }, default=str)
+    print("-- RES", res)
+    return res
+
+# @tool
+# def analyse_erosion_evolution(
+# inspection_id: int,
+# turbine_id: int | None = None,
+# site_id: int | None = None,
+# previous_inspection_id: int | None = None,
+# blade: str | None = None,
+# include_areas: bool = True) -> str:
+#     '''Tell how the leading edge erosion evolved between two inspection campaigns, for one turbine or a whole site.
+
+#     Use this when the user asks how the erosion evolved or changed. Erosion is measured as the
+#     total eroded length along the leading edge of each blade, in meters.
+
+#     Pass either turbine_id for a single turbine, or site_id to cover every
+#     turbine of a site in one call — never both. Prefer site_id over looping
+#     turbine by turbine: one call reads the whole site at once and is far faster.
+    
+#     When you use the site_id you will receive less data to get a smaller payload 
+
+#     Asking about a whole site is not asking about repairs. Report how the erosion
+#     evolved and stop there: do not rank turbines for repair, do not recommend
+#     what to fix first, do not bring up repair methods, costs or planning unless
+#     the user asked about them. Those questions have their own tools —
+#     prioritize_campaign_repair for what to repair first, aep_loss_on_a_site_for_each_turbine
+#     for the energy at stake. Wait for the user to raise the subject.
+
+#     A change is only reported as significant when the eroded length varies by
+#     more than 5%. Below that, the difference cannot be told apart from
+#     measurement variation, and the blade is reported as stable.
+
+#     Erosion never shrinks: it can only appear, grow, stay as it is, or be
+#     repaired. When previous_total_eroded_length is larger than
+#     total_eroded_length, that is a difference between the two measurements, not a
+#     physical change — report it as unchanged, and never describe the erosion as
+#     having shrunk, reduced, receded, healed or improved. The same holds for each
+#     eroded area.
+
+#     Args:
+#         inspection_id: The campaign to look at. Required — this tool never
+#             picks a campaign on its own. If the user did not name one, resolve it
+#             first: use the campaign from the page context when there is one, or
+#             ask the user which campaign they mean.
+#         turbine_id: The turbine to analyse. Give either this or site_id, not
+#             both. Use it when the user asks about one named turbine.
+#         site_id: The site to analyse. Every turbine of the park is covered, even
+#             those inspected in a different batch than inspection_id — each one
+#             is compared using its own campaign. Use it for questions about a
+#             whole park: "which turbines are worst on this site", "how did erosion
+#             progress here".
+#         previous_inspection_id: Optional. The campaign to compare against.
+#             When omitted, each turbine is compared with the campaign right before
+#             its own — which may differ from one turbine to another when a site
+#             was inspected in several batches. This is the normal case; pass it
+#             only when the user asks to compare with one specific older campaign
+#             for everything.
+#         blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
+#         include_areas: Optional, default True. Set False to get only the blade
+#             totals and skip the zone-by-zone breakdown. On a whole site, prefer
+#             False unless the user really wants zone detail — the full breakdown
+#             for 40 turbines is a very long answer.
+
+#     Returns:
+#         One entry per turbine, each with its id and name, the campaign it was
+#         read from, the previous campaign it was compared against, and one entry
+#         per eroded blade:
+#         - total_eroded_length and previous_total_eroded_length, in meters along
+#           the leading edge, plus the delta and the percentage of change
+#         - status: new (no erosion before), grown, stable, or repaired (erosion
+#           before, none now)
+#         - eroded_areas_count: how many separate eroded zones, then and now. A
+#           count that drops while the length grows means zones merged, not that
+#           erosion receded
+#         - laminate_length: how much of the erosion reached the laminate rather
+#           than only the coat. This is the depth of the erosion, and it drives the
+#           repair method
+#         - spreads_to_pressure_side and spreads_to_suction_side, with their
+#           previous values: erosion spreading sideways off the leading edge is a
+#           change of nature, not just of size
+#         When include_areas is True, each blade also carries eroded_areas: one
+#         entry per zone with its radius range, eroded length then and now, deepest
+#         damaged part, max severity, WIND index, and how far it spreads onto each
+#         side. Zones are matched across campaigns by radius overlap, so treat
+#         their individual status as indicative and the blade total as the answer.
+#         growth_was_predicted marks a zone whose WIND index had already forecast
+#         the worsening.
+
+#         A blade with no erosion in either campaign does not appear, and neither
+#         does a turbine with no eroded blade at all — an absent turbine is a
+#         healthy one. Two lists say what was left out and why:
+#         turbines_never_inspected (no campaign at all at that date) and
+#         turbines_without_previous (nothing earlier to compare with). Both carry
+#         the turbine id and name, so they can be named to the user.
+#     '''
+#     print("TOOL_CALL analyse_erosion_evolution", inspection_id, turbine_id, site_id, previous_inspection_id, blade, include_areas)
+
+#     if not turbine_id and not site_id:
+#         return "ERROR: give either turbine_id or site_id"
+#     if turbine_id and site_id:
+#         return "ERROR: give turbine_id or site_id, not both"
+
+#     # ------------------------------------------------------------------ #
+#     # 1. Turbines concernées, et campagne courante de chacune
+#     #
+#     # Mode site : on part de TOUTES les turbines du parc, pas du périmètre de
+#     # l'inspection demandée — un site inspecté en deux lots resterait
+#     # sinon à moitié couvert.
+#     # ------------------------------------------------------------------ #
+#     if turbine_id:
+#         turbine_ids = [turbine_id]
+#         current_by_turbine = {turbine_id: inspection_id}
+#         never_inspected = []
+#     else:
+#         turbine_ids = resolve_site_turbine_ids(site_id)
+#         if not turbine_ids:
+#             return "ERROR: no turbine found for this site"
+
+#         current_by_turbine = resolve_current_by_turbine(turbine_ids, inspection_id)
+#         never_inspected = [tid for tid in turbine_ids if tid not in current_by_turbine]
+#         turbine_ids = [tid for tid in turbine_ids if tid in current_by_turbine]
+
+#     if not turbine_ids:
+#         return "ERROR: none of the turbines of this site was inspected at that date"
+
+#     if previous_inspection_id is not None:
+#         previous_by_turbine = {tid: previous_inspection_id for tid in turbine_ids}
+#     else:
+#         previous_by_turbine = resolve_previous_by_turbine(current_by_turbine)
+
+#     without_previous = [tid for tid in turbine_ids if tid not in previous_by_turbine]
+#     turbine_ids = [tid for tid in turbine_ids if tid in previous_by_turbine]
+
+#     if not turbine_ids:
+#         return ("ERROR: no earlier inspection campaign with damages for these turbines, "
+#                 "there is nothing to compare with")
+
+#     # ------------------------------------------------------------------ #
+#     # 2. Chargement groupé : une requête par inspection distincte, dans
+#     #    les deux sens. Sur un site classique cela fait 2 requêtes, pas 2xN.
+#     # ------------------------------------------------------------------ #
+#     current_data_by_inspection = {}
+#     for current_id in set(current_by_turbine[tid] for tid in turbine_ids):
+#         concerned = [tid for tid in turbine_ids if current_by_turbine[tid] == current_id]
+#         current_data_by_inspection[current_id] = fetch_erosion_data_bulk(
+#             current_id, concerned)
+
+#     previous_data_by_inspection = {}
+#     for previous_id in set(previous_by_turbine[tid] for tid in turbine_ids):
+#         concerned = [tid for tid in turbine_ids if previous_by_turbine[tid] == previous_id]
+#         previous_data_by_inspection[previous_id] = fetch_erosion_data_bulk(
+#             previous_id, concerned)
+
+#     # ------------------------------------------------------------------ #
+#     # 3. Comparaison
+#     # ------------------------------------------------------------------ #
+#     turbines_payload = compare_turbines(
+#         turbine_ids, current_by_turbine, previous_by_turbine,
+#         current_data_by_inspection, previous_data_by_inspection,
+#         blade, include_areas,
+#     )
+
+#     # Le nom de la turbine ne sort pas des requêtes de dommages : une seule
+#     # requête ici, pour les turbines analysées et celles qui ont été écartées.
+#     turbine_names = resolve_turbine_names(
+#         turbine_ids + never_inspected + without_previous)
+
+#     for entry in turbines_payload:
+#         entry["turbine_name"] = turbine_names.get(entry["turbine_id"])
+
+#     def named(ids):
+#         return [{"turbine_id": tid, "turbine_name": turbine_names.get(tid)}
+#                 for tid in ids]
+
+#     for turbine in turbines_payload:
+#         deltas = [b["length_delta"] for b in turbine["blades"]]
+#         turbine["turbine_mean_growth_in_meters"] = round(mean(deltas), 2)
+
+#     site_growth = [b["length_delta"] for t in turbines_payload for b in t["blades"]]
+
+#     BLADE_KEYS = [
+#         "blade", "status", "total_eroded_length", "length_delta",
+#         "spreads_to_pressure_side", "spreads_to_suction_side",
+#         "previously_spread_to_pressure_side", "previously_spread_to_suction_side",
+#     ]
+
+#     def slim_blade(blade):
+#         slim = {}
+#         for key in BLADE_KEYS:
+#             value = blade.get(key)
+#             slim[key] = round(value, 2) if isinstance(value, float) else value
+#         return slim
+
+#     if site_id:
+#         turbines_payload = [
+#         {
+#             "turbine_id": turbine["turbine_id"],
+#             "turbine_name": turbine["turbine_name"],
+#             "planification_id": turbine["planification_id"],
+#             "previous_planification_id": turbine["previous_planification_id"],
+#             "turbine_mean_growth_in_meters": round(
+#                 mean(b["length_delta"] for b in turbine["blades"]), 2),
+#             "blades": [slim_blade(b) for b in turbine["blades"]],
+#         }
+#         for turbine in turbines_payload
+#         if turbine["blades"]
+#     ]
+
+#     payload = {
+#         "inspection_id": inspection_id,
+#         "site_id": site_id,
+#         "site_name":get_site_name(site_id),
+#         "turbines": turbines_payload,
+#         "site_mean_growth_in_meter": round(mean(site_growth), 2) if site_growth else None,
+#         "site_median_growth_in_meter": round(median(site_growth), 2) if site_growth else None,
+#         "turbines_never_inspected": named(never_inspected),
+#         "turbines_without_previous": named(without_previous),
+#     }
+
+#     resp = json.dumps(payload, default=str); print(resp)
+#     return resp
+
+
+# @tool
+# def analyse_erosion(
+#     inspection_id: int,
+#     site_id: int,
+#     turbine_ids: list[int] | None = None,
+#     blade: str | None = None,
+#     include_areas: bool = True,
+# ) -> str:
+#     """_summary_
+
+#     Args:
+#         inspection_id (_type_, optional): _description_. Defaults to None, site_id: int  |  None = None, previous_inspection_id: int  |  None = None, blade: str  |  None = None, include_areas: bool = True)->str:.
+#     """
+#     pass
+#     print(
+#         "TOOL_CALL analyse_erosion",
+#         "inspection_id", inspection_id,
+#         "turbine_ids", turbine_ids,
+#         "site_id", site_id,
+#         "blade", blade,
+#         "include_areas", include_areas,
+#     )
+#     ####
+#     # FAIRE LE MEME COMPORTEMEN?T QUE DANS
+#     # count_damage_on_a_site_turbines#
+
+#     #On commence par récupérer toutes les turbines du sites. Si on ne fournit pas de turbine_ids
+#     if not turbine_ids:
+#         turbine_ids = resolve_site_turbine_ids(site_id)
+#         if not turbine_ids:
+#             return "ERROR: no turbine found for this site"
+    
+    
+#     current_by_turbine = resolve_current_by_turbine(turbine_ids, inspection_id)
+#     never_inspected = [tid for tid in turbine_ids if tid not in current_by_turbine]
+#     turbine_ids = [tid for tid in turbine_ids if tid in current_by_turbine]
+
+#     if not turbine_ids:
+#         return "ERROR: none of the turbines of this site was inspected at that date"
+
+#     current_data_by_inspection = {}
+#     for current_id in set(current_by_turbine[tid] for tid in turbine_ids):
+#         concerned = [tid for tid in turbine_ids if current_by_turbine[tid] == current_id]
+#         current_data_by_inspection[current_id] = fetch_erosion_data_bulk(
+#             current_id, concerned)
+        
+#     turbines_payload = get_current_data_for_turbines(turbine_ids, current_by_turbine,
+#                                 current_data_by_inspection,
+#                                 blade, include_areas)
+#     turbine_names = resolve_turbine_names(
+#         turbine_ids + never_inspected)
+#     print(turbines_payload)
+#     for entry in turbines_payload:
+#         entry["turbine_name"] = turbine_names.get(entry["turbine_id"])
+        
+#     if site_id:
+#         turbines_payload = [
+#         {
+#             "turbine_id": turbine["turbine_id"],
+#             "turbine_name": turbine["turbine_name"],
+#             "planification_id": turbine["planification_id"],
+#             "turbine_erosion_mean_in_meters": round(
+#                 mean(b["total_eroded_length"] for b in turbine["blades"]), 2),
+#             "turbine_erosion_total_in_meters": round(
+#                 sum(b["total_eroded_length"] for b in turbine["blades"]), 2),
+#             "blades": [turbine["blades"]],
+#         }
+#         for turbine in turbines_payload
+#         if turbine["blades"]
+#         ]
+        
+#         payload = {
+#         "inspection_id": inspection_id,
+#         "site_id": site_id,
+#         "site_name":get_site_name(site_id),
+#         "turbines": turbines_payload,
+#         # "site_mean_growth_in_meter": round(mean(site_growth), 2) if site_growth else None,
+#         # "site_median_growth_in_meter": round(median(site_growth), 2) if site_growth else None,
+#         # "turbines_never_inspected": named(never_inspected),
+#         # "turbines_without_previous": named(without_previous),
+#     }
+        
+        
+#     return json.dumps(payload, default=str)
