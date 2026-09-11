@@ -257,10 +257,6 @@ def fetch_crack_data(planification_id, turbine_id):
     return cursor_to_dataframe(TW_DB_CURSOR)
 
 
-def fetch_erosion_data(planification_id, turbine_id):
-    TW_DB_CURSOR.execute(EROSION_QUERY, (planification_id, turbine_id, LEE_DEFECT_TYPE))
-    return cursor_to_dataframe(TW_DB_CURSOR)
-
 
 def fetch_erosion_data_bulk(planification_id, turbine_ids):
     """Dommages d'érosion de plusieurs turbines, en une seule requête."""
@@ -276,6 +272,7 @@ def fetch_erosion_data_bulk(planification_id, turbine_ids):
 
 def resolve_previous_planification(turbine_id, planification_id):
     """Campagne d'inspection précédant celle donnée, ou None s'il n'y en a pas."""
+    
     TW_DB_CURSOR.execute(PLANIFICATION_HISTORY_QUERY, (turbine_id, planification_id))
     row = TW_DB_CURSOR.fetchone()
     return row[0] if row else None  # planification_id, première colonne du SELECT
@@ -335,6 +332,7 @@ def resolve_previous_by_turbine(turbine_ids_or_map, planification_id=None):
     dictionnaire {turbine_id: sa campagne courante} — chaque turbine est alors
     comparée à ce qui précède SA campagne, pas celle du lot voisin.
     """
+    
     if isinstance(turbine_ids_or_map, dict):
         pairs = list(turbine_ids_or_map.items())
     else:
@@ -992,7 +990,7 @@ class BladeErosionEvolution:
     """Bilan d'une pale : c'est la longueur érodée totale qui fait référence."""
 
     blade: str
-    status: str                    # new / grown / stable / repaired
+    status: str
     total_eroded_length: float
     previous_total_eroded_length: float 
     length_delta: float 
@@ -1033,7 +1031,6 @@ class ErodedArea:
     blade: str
     radius_start: float
     radius_end: float
-    status: str                        # new / grown / stable / repaired
     eroded_length: float | None = None
 
     deepest_part: str | None = None    # Coat / Laminate / LE Tape
@@ -1281,4 +1278,83 @@ def get_current_data_for_turbines(turbine_ids, current_by_turbine,
 
 
 
-###The default one is for Leeding Edge Erosion for VESTAS and cracks fo ENERCON.
+# pour tout le site au lieu d'une par turbine.
+CRACK_QUERY_BULK = CRACK_QUERY.replace(
+    "AND planification_id = %s AND turbine_id = %s",
+    "AND planification_id = %s AND turbine_id = ANY(%s)",
+)
+ 
+ 
+def fetch_crack_data_bulk(planification_id, turbine_ids):
+    """Fissures de plusieurs turbines, en une seule requête."""
+    if not turbine_ids:
+        return pd.DataFrame()
+ 
+    TW_DB_CURSOR.execute(
+        CRACK_QUERY_BULK,
+        (planification_id, list(turbine_ids), CRACK_DEFECT_TYPE),
+    )
+    return cursor_to_dataframe(TW_DB_CURSOR)
+ 
+ 
+def describe_blade_cracks(blade_data, blade_name):
+    """Fissures d'une pale, sans comparaison.
+ 
+    Renvoie une liste de dictionnaires, une entrée par fissure — ou une liste
+    vide si la pale n'a aucune fissure.
+    """
+    cracks_by_face = build_cracks_by_face(blade_data)
+    if cracks_by_face is None:
+        return []
+ 
+    described_cracks = []
+    for face_name in FACES:
+        for crack in cracks_by_face.get(face_name, []):
+            size, unit = get_crack_measurement(crack)
+ 
+            described_cracks.append({
+                "damage_id": crack["id"],
+                "blade": blade_name,
+                "face": face_name,
+                "radius": crack.get("radius"),
+                "orientation": crack.get("orientation"),
+                "shape": crack.get("shape"),
+                "severity": crack.get("sev"),
+                # Coat / Laminate / Bonding line / Tip end : la profondeur
+                "damaged_part": crack.get("part"),
+                "size": size,
+                "measured_as": unit,
+                "wind": crack.get("wind"),
+                # db = mesure saisie à la main, image = mesure calculée
+                "measure_source": measure_source(crack),
+            })
+ 
+    return described_cracks
+ 
+ 
+def get_cracks_for_turbines(turbine_ids, crack_data):
+    """Fissures de plusieurs turbines, à partir d'un DataFrame déjà chargé.
+ 
+    Pendant de get_current_data_for_turbines côté fissures. Une turbine sans
+    fissure n'apparaît pas dans le résultat.
+    """
+    turbines_with_cracks = []
+ 
+    for turbine_id in turbine_ids:
+        turbine_data = select_turbine(crack_data, turbine_id)
+ 
+        blades = []
+        for blade_name in BLADES:
+            cracks = describe_blade_cracks(
+                select_blade(turbine_data, blade_name), blade_name)
+            if cracks:
+                blades.append({"blade": blade_name, "cracks": cracks})
+ 
+        if blades:
+            turbines_with_cracks.append({
+                "turbine_id": turbine_id,
+                "blades": blades,
+            })
+ 
+    return turbines_with_cracks
+ 

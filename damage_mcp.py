@@ -33,6 +33,7 @@ def get_damage_path(individual_damage_id: int) -> str:
         SELECT incident_records.report_path \
         FROM incident_records \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
+        JOIN sites ON sites.id = turbines.site_id \
         JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
         WHERE incident_records.id = %s \
     "
@@ -930,308 +931,456 @@ only_changed: bool = False) -> str:
     print("-- RES", res)
     return res
 
-# @tool
-# def analyse_erosion_evolution(
-# inspection_id: int,
-# turbine_id: int | None = None,
-# site_id: int | None = None,
-# previous_inspection_id: int | None = None,
-# blade: str | None = None,
-# include_areas: bool = True) -> str:
-#     '''Tell how the leading edge erosion evolved between two inspection campaigns, for one turbine or a whole site.
+@tool
+def analyse_erosion_evolution(
+inspection_id: int,
+turbine_id: int | None = None,
+site_id: int | None = None,
+previous_inspection_id: int | None = None,
+blade: str | None = None,
+include_areas: bool = True) -> str:
+    '''Tell how the leading edge erosion evolved between two inspection campaigns, for one turbine or a whole site.
 
-#     Use this when the user asks how the erosion evolved or changed. Erosion is measured as the
-#     total eroded length along the leading edge of each blade, in meters.
+    Use this when the user asks how the erosion evolved or changed. Erosion is measured as the
+    total eroded length along the leading edge of each blade, in meters.
 
-#     Pass either turbine_id for a single turbine, or site_id to cover every
-#     turbine of a site in one call — never both. Prefer site_id over looping
-#     turbine by turbine: one call reads the whole site at once and is far faster.
+    Pass either turbine_id for a single turbine, or site_id to cover every
+    turbine of a site in one call — never both. Prefer site_id over looping
+    turbine by turbine: one call reads the whole site at once and is far faster.
     
-#     When you use the site_id you will receive less data to get a smaller payload 
+    When you use the site_id you will receive less data to get a smaller payload 
 
-#     Asking about a whole site is not asking about repairs. Report how the erosion
-#     evolved and stop there: do not rank turbines for repair, do not recommend
-#     what to fix first, do not bring up repair methods, costs or planning unless
-#     the user asked about them. Those questions have their own tools —
-#     prioritize_campaign_repair for what to repair first, aep_loss_on_a_site_for_each_turbine
-#     for the energy at stake. Wait for the user to raise the subject.
+    Asking about a whole site is not asking about repairs. Report how the erosion
+    evolved and stop there: do not rank turbines for repair, do not recommend
+    what to fix first, do not bring up repair methods, costs or planning unless
+    the user asked about them. Those questions have their own tools —
+    prioritize_campaign_repair for what to repair first, aep_loss_on_a_site_for_each_turbine
+    for the energy at stake. Wait for the user to raise the subject.
 
-#     A change is only reported as significant when the eroded length varies by
-#     more than 5%. Below that, the difference cannot be told apart from
-#     measurement variation, and the blade is reported as stable.
+    A change is only reported as significant when the eroded length varies by
+    more than 5%. Below that, the difference cannot be told apart from
+    measurement variation, and the blade is reported as stable.
 
-#     Erosion never shrinks: it can only appear, grow, stay as it is, or be
-#     repaired. When previous_total_eroded_length is larger than
-#     total_eroded_length, that is a difference between the two measurements, not a
-#     physical change — report it as unchanged, and never describe the erosion as
-#     having shrunk, reduced, receded, healed or improved. The same holds for each
-#     eroded area.
+    Erosion never shrinks: it can only appear, grow, stay as it is, or be
+    repaired. When previous_total_eroded_length is larger than
+    total_eroded_length, that is a difference between the two measurements, not a
+    physical change — report it as unchanged, and never describe the erosion as
+    having shrunk, reduced, receded, healed or improved. The same holds for each
+    eroded area.
 
-#     Args:
-#         inspection_id: The campaign to look at. Required — this tool never
-#             picks a campaign on its own. If the user did not name one, resolve it
-#             first: use the campaign from the page context when there is one, or
-#             ask the user which campaign they mean.
-#         turbine_id: The turbine to analyse. Give either this or site_id, not
-#             both. Use it when the user asks about one named turbine.
-#         site_id: The site to analyse. Every turbine of the park is covered, even
-#             those inspected in a different batch than inspection_id — each one
-#             is compared using its own campaign. Use it for questions about a
-#             whole park: "which turbines are worst on this site", "how did erosion
-#             progress here".
-#         previous_inspection_id: Optional. The campaign to compare against.
-#             When omitted, each turbine is compared with the campaign right before
-#             its own — which may differ from one turbine to another when a site
-#             was inspected in several batches. This is the normal case; pass it
-#             only when the user asks to compare with one specific older campaign
-#             for everything.
-#         blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
-#         include_areas: Optional, default True. Set False to get only the blade
-#             totals and skip the zone-by-zone breakdown. On a whole site, prefer
-#             False unless the user really wants zone detail — the full breakdown
-#             for 40 turbines is a very long answer.
+    Args:
+        inspection_id: The campaign to look at. Required — this tool never
+            picks a campaign on its own. If the user did not name one, resolve it
+            first: use the campaign from the page context when there is one, or
+            ask the user which campaign they mean.
+        turbine_id: The turbine to analyse. Give either this or site_id, not
+            both. Use it when the user asks about one named turbine.
+        site_id: The site to analyse. Every turbine of the park is covered, even
+            those inspected in a different batch than inspection_id — each one
+            is compared using its own campaign. Use it for questions about a
+            whole park: "which turbines are worst on this site", "how did erosion
+            progress here".
+        previous_inspection_id: Optional. The campaign to compare against.
+            When omitted, each turbine is compared with the campaign right before
+            its own — which may differ from one turbine to another when a site
+            was inspected in several batches. This is the normal case; pass it
+            only when the user asks to compare with one specific older campaign
+            for everything.
+        blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
+        include_areas: Optional, default True. Set False to get only the blade
+            totals and skip the zone-by-zone breakdown. On a whole site, prefer
+            False unless the user really wants zone detail — the full breakdown
+            for 40 turbines is a very long answer.
 
-#     Returns:
-#         One entry per turbine, each with its id and name, the campaign it was
-#         read from, the previous campaign it was compared against, and one entry
-#         per eroded blade:
-#         - total_eroded_length and previous_total_eroded_length, in meters along
-#           the leading edge, plus the delta and the percentage of change
-#         - status: new (no erosion before), grown, stable, or repaired (erosion
-#           before, none now)
-#         - eroded_areas_count: how many separate eroded zones, then and now. A
-#           count that drops while the length grows means zones merged, not that
-#           erosion receded
-#         - laminate_length: how much of the erosion reached the laminate rather
-#           than only the coat. This is the depth of the erosion, and it drives the
-#           repair method
-#         - spreads_to_pressure_side and spreads_to_suction_side, with their
-#           previous values: erosion spreading sideways off the leading edge is a
-#           change of nature, not just of size
-#         When include_areas is True, each blade also carries eroded_areas: one
-#         entry per zone with its radius range, eroded length then and now, deepest
-#         damaged part, max severity, WIND index, and how far it spreads onto each
-#         side. Zones are matched across campaigns by radius overlap, so treat
-#         their individual status as indicative and the blade total as the answer.
-#         growth_was_predicted marks a zone whose WIND index had already forecast
-#         the worsening.
+    Returns:
+        One entry per turbine, each with its id and name, the campaign it was
+        read from, the previous campaign it was compared against, and one entry
+        per eroded blade:
+        - total_eroded_length and previous_total_eroded_length, in meters along
+          the leading edge, plus the delta and the percentage of change
+        - status: new (no erosion before), grown, stable, or repaired (erosion
+          before, none now)
+        - eroded_areas_count: how many separate eroded zones, then and now. A
+          count that drops while the length grows means zones merged, not that
+          erosion receded
+        - laminate_length: how much of the erosion reached the laminate rather
+          than only the coat. This is the depth of the erosion, and it drives the
+          repair method
+        - spreads_to_pressure_side and spreads_to_suction_side, with their
+          previous values: erosion spreading sideways off the leading edge is a
+          change of nature, not just of size
+        When include_areas is True, each blade also carries eroded_areas: one
+        entry per zone with its radius range, eroded length then and now, deepest
+        damaged part, max severity, WIND index, and how far it spreads onto each
+        side. Zones are matched across campaigns by radius overlap, so treat
+        their individual status as indicative and the blade total as the answer.
+        growth_was_predicted marks a zone whose WIND index had already forecast
+        the worsening.
 
-#         A blade with no erosion in either campaign does not appear, and neither
-#         does a turbine with no eroded blade at all — an absent turbine is a
-#         healthy one. Two lists say what was left out and why:
-#         turbines_never_inspected (no campaign at all at that date) and
-#         turbines_without_previous (nothing earlier to compare with). Both carry
-#         the turbine id and name, so they can be named to the user.
-#     '''
-#     print("TOOL_CALL analyse_erosion_evolution", inspection_id, turbine_id, site_id, previous_inspection_id, blade, include_areas)
+        A blade with no erosion in either campaign does not appear, and neither
+        does a turbine with no eroded blade at all — an absent turbine is a
+        healthy one. Two lists say what was left out and why:
+        turbines_never_inspected (no campaign at all at that date) and
+        turbines_without_previous (nothing earlier to compare with). Both carry
+        the turbine id and name, so they can be named to the user.
+    '''
+    print("TOOL_CALL analyse_erosion_evolution", inspection_id, turbine_id, site_id, previous_inspection_id, blade, include_areas)
 
-#     if not turbine_id and not site_id:
-#         return "ERROR: give either turbine_id or site_id"
-#     if turbine_id and site_id:
-#         return "ERROR: give turbine_id or site_id, not both"
+    if not turbine_id and not site_id:
+        return "ERROR: give either turbine_id or site_id"
+    if turbine_id and site_id:
+        return "ERROR: give turbine_id or site_id, not both"
 
-#     # ------------------------------------------------------------------ #
-#     # 1. Turbines concernées, et campagne courante de chacune
-#     #
-#     # Mode site : on part de TOUTES les turbines du parc, pas du périmètre de
-#     # l'inspection demandée — un site inspecté en deux lots resterait
-#     # sinon à moitié couvert.
-#     # ------------------------------------------------------------------ #
-#     if turbine_id:
-#         turbine_ids = [turbine_id]
-#         current_by_turbine = {turbine_id: inspection_id}
-#         never_inspected = []
-#     else:
-#         turbine_ids = resolve_site_turbine_ids(site_id)
-#         if not turbine_ids:
-#             return "ERROR: no turbine found for this site"
+    # ------------------------------------------------------------------ #
+    # 1. Turbines concernées, et campagne courante de chacune
+    #
+    # Mode site : on part de TOUTES les turbines du parc, pas du périmètre de
+    # l'inspection demandée — un site inspecté en deux lots resterait
+    # sinon à moitié couvert.
+    # ------------------------------------------------------------------ #
+    if turbine_id:
+        turbine_ids = [turbine_id]
+        current_by_turbine = {turbine_id: inspection_id}
+        never_inspected = []
+    else:
+        turbine_ids = resolve_site_turbine_ids(site_id)
+        if not turbine_ids:
+            return "ERROR: no turbine found for this site"
+        current_by_turbine = resolve_current_by_turbine(turbine_ids, inspection_id)
+        never_inspected = [tid for tid in turbine_ids if tid not in current_by_turbine]
+        turbine_ids = [tid for tid in turbine_ids if tid in current_by_turbine]
+    if not turbine_ids:
+        return "ERROR: none of the turbines of this site was inspected at that date"
 
-#         current_by_turbine = resolve_current_by_turbine(turbine_ids, inspection_id)
-#         never_inspected = [tid for tid in turbine_ids if tid not in current_by_turbine]
-#         turbine_ids = [tid for tid in turbine_ids if tid in current_by_turbine]
+    if previous_inspection_id is not None:
+        previous_by_turbine = {tid: previous_inspection_id for tid in turbine_ids}
+    else:
+        
+        previous_by_turbine = resolve_previous_by_turbine(current_by_turbine)
 
-#     if not turbine_ids:
-#         return "ERROR: none of the turbines of this site was inspected at that date"
+    without_previous = [tid for tid in turbine_ids if tid not in previous_by_turbine]
+    turbine_ids = [tid for tid in turbine_ids if tid in previous_by_turbine]
 
-#     if previous_inspection_id is not None:
-#         previous_by_turbine = {tid: previous_inspection_id for tid in turbine_ids}
-#     else:
-#         previous_by_turbine = resolve_previous_by_turbine(current_by_turbine)
+    if not turbine_ids:
+        return ("ERROR: no earlier inspection campaign with damages for these turbines, "
+                "there is nothing to compare with")
 
-#     without_previous = [tid for tid in turbine_ids if tid not in previous_by_turbine]
-#     turbine_ids = [tid for tid in turbine_ids if tid in previous_by_turbine]
+    # ------------------------------------------------------------------ #
+    # 2. Chargement groupé : une requête par inspection distincte, dans
+    #    les deux sens. Sur un site classique cela fait 2 requêtes, pas 2xN.
+    # ------------------------------------------------------------------ #
+    current_data_by_inspection = {}
+    for current_id in set(current_by_turbine[tid] for tid in turbine_ids):
+        concerned = [tid for tid in turbine_ids if current_by_turbine[tid] == current_id]
+        current_data_by_inspection[current_id] = fetch_erosion_data_bulk(
+            current_id, concerned)
 
-#     if not turbine_ids:
-#         return ("ERROR: no earlier inspection campaign with damages for these turbines, "
-#                 "there is nothing to compare with")
+    previous_data_by_inspection = {}
+    for previous_id in set(previous_by_turbine[tid] for tid in turbine_ids):
+        concerned = [tid for tid in turbine_ids if previous_by_turbine[tid] == previous_id]
+        previous_data_by_inspection[previous_id] = fetch_erosion_data_bulk(
+            previous_id, concerned)
 
-#     # ------------------------------------------------------------------ #
-#     # 2. Chargement groupé : une requête par inspection distincte, dans
-#     #    les deux sens. Sur un site classique cela fait 2 requêtes, pas 2xN.
-#     # ------------------------------------------------------------------ #
-#     current_data_by_inspection = {}
-#     for current_id in set(current_by_turbine[tid] for tid in turbine_ids):
-#         concerned = [tid for tid in turbine_ids if current_by_turbine[tid] == current_id]
-#         current_data_by_inspection[current_id] = fetch_erosion_data_bulk(
-#             current_id, concerned)
+    # ------------------------------------------------------------------ #
+    # 3. Comparaison
+    # ------------------------------------------------------------------ #
+    turbines_payload = compare_turbines(
+        turbine_ids, current_by_turbine, previous_by_turbine,
+        current_data_by_inspection, previous_data_by_inspection,
+        blade, include_areas,
+    )
 
-#     previous_data_by_inspection = {}
-#     for previous_id in set(previous_by_turbine[tid] for tid in turbine_ids):
-#         concerned = [tid for tid in turbine_ids if previous_by_turbine[tid] == previous_id]
-#         previous_data_by_inspection[previous_id] = fetch_erosion_data_bulk(
-#             previous_id, concerned)
+    # Le nom de la turbine ne sort pas des requêtes de dommages : une seule
+    # requête ici, pour les turbines analysées et celles qui ont été écartées.
+    turbine_names = resolve_turbine_names(
+        turbine_ids + never_inspected + without_previous)
 
-#     # ------------------------------------------------------------------ #
-#     # 3. Comparaison
-#     # ------------------------------------------------------------------ #
-#     turbines_payload = compare_turbines(
-#         turbine_ids, current_by_turbine, previous_by_turbine,
-#         current_data_by_inspection, previous_data_by_inspection,
-#         blade, include_areas,
-#     )
+    for entry in turbines_payload:
+        entry["turbine_name"] = turbine_names.get(entry["turbine_id"])
 
-#     # Le nom de la turbine ne sort pas des requêtes de dommages : une seule
-#     # requête ici, pour les turbines analysées et celles qui ont été écartées.
-#     turbine_names = resolve_turbine_names(
-#         turbine_ids + never_inspected + without_previous)
+    def named(ids):
+        return [{"turbine_id": tid, "turbine_name": turbine_names.get(tid)}
+                for tid in ids]
 
-#     for entry in turbines_payload:
-#         entry["turbine_name"] = turbine_names.get(entry["turbine_id"])
+    for turbine in turbines_payload:
+        deltas = [b["length_delta"] for b in turbine["blades"]]
+        turbine["turbine_mean_growth_in_meters"] = round(mean(deltas), 2)
 
-#     def named(ids):
-#         return [{"turbine_id": tid, "turbine_name": turbine_names.get(tid)}
-#                 for tid in ids]
+    site_growth = [b["length_delta"] for t in turbines_payload for b in t["blades"]]
 
-#     for turbine in turbines_payload:
-#         deltas = [b["length_delta"] for b in turbine["blades"]]
-#         turbine["turbine_mean_growth_in_meters"] = round(mean(deltas), 2)
+    BLADE_KEYS = [
+        "blade", "status", "total_eroded_length", "length_delta",
+        "spreads_to_pressure_side", "spreads_to_suction_side",
+        "previously_spread_to_pressure_side", "previously_spread_to_suction_side",
+    ]
 
-#     site_growth = [b["length_delta"] for t in turbines_payload for b in t["blades"]]
-
-#     BLADE_KEYS = [
-#         "blade", "status", "total_eroded_length", "length_delta",
-#         "spreads_to_pressure_side", "spreads_to_suction_side",
-#         "previously_spread_to_pressure_side", "previously_spread_to_suction_side",
-#     ]
-
-#     def slim_blade(blade):
-#         slim = {}
-#         for key in BLADE_KEYS:
-#             value = blade.get(key)
-#             slim[key] = round(value, 2) if isinstance(value, float) else value
-#         return slim
-
-#     if site_id:
-#         turbines_payload = [
-#         {
-#             "turbine_id": turbine["turbine_id"],
-#             "turbine_name": turbine["turbine_name"],
-#             "planification_id": turbine["planification_id"],
-#             "previous_planification_id": turbine["previous_planification_id"],
-#             "turbine_mean_growth_in_meters": round(
-#                 mean(b["length_delta"] for b in turbine["blades"]), 2),
-#             "blades": [slim_blade(b) for b in turbine["blades"]],
-#         }
-#         for turbine in turbines_payload
-#         if turbine["blades"]
-#     ]
-
-#     payload = {
-#         "inspection_id": inspection_id,
-#         "site_id": site_id,
-#         "site_name":get_site_name(site_id),
-#         "turbines": turbines_payload,
-#         "site_mean_growth_in_meter": round(mean(site_growth), 2) if site_growth else None,
-#         "site_median_growth_in_meter": round(median(site_growth), 2) if site_growth else None,
-#         "turbines_never_inspected": named(never_inspected),
-#         "turbines_without_previous": named(without_previous),
-#     }
-
-#     resp = json.dumps(payload, default=str); print(resp)
-#     return resp
-
-
-# @tool
-# def analyse_erosion(
-#     inspection_id: int,
-#     site_id: int,
-#     turbine_ids: list[int] | None = None,
-#     blade: str | None = None,
-#     include_areas: bool = True,
-# ) -> str:
-#     """_summary_
-
-#     Args:
-#         inspection_id (_type_, optional): _description_. Defaults to None, site_id: int  |  None = None, previous_inspection_id: int  |  None = None, blade: str  |  None = None, include_areas: bool = True)->str:.
-#     """
-#     pass
-#     print(
-#         "TOOL_CALL analyse_erosion",
-#         "inspection_id", inspection_id,
-#         "turbine_ids", turbine_ids,
-#         "site_id", site_id,
-#         "blade", blade,
-#         "include_areas", include_areas,
-#     )
-#     ####
-#     # FAIRE LE MEME COMPORTEMEN?T QUE DANS
-#     # count_damage_on_a_site_turbines#
-
-#     #On commence par récupérer toutes les turbines du sites. Si on ne fournit pas de turbine_ids
-#     if not turbine_ids:
-#         turbine_ids = resolve_site_turbine_ids(site_id)
-#         if not turbine_ids:
-#             return "ERROR: no turbine found for this site"
+    def slim_blade(blade):
+        print(blade.keys())
+        slim = {}
+        for key in BLADE_KEYS:
+            value = blade.get(key)
+            slim[key] = round(value, 2) if isinstance(value, float) else value
+        return slim
     
     
-#     current_by_turbine = resolve_current_by_turbine(turbine_ids, inspection_id)
-#     never_inspected = [tid for tid in turbine_ids if tid not in current_by_turbine]
-#     turbine_ids = [tid for tid in turbine_ids if tid in current_by_turbine]
 
-#     if not turbine_ids:
-#         return "ERROR: none of the turbines of this site was inspected at that date"
+    turbines_payload = [
+        (
+            TurbineEvolution(
+                turbine = Turbine(id=turbine["turbine_id"],
+                                    name= turbine["turbine_name"],
+                                    age=get_turbine_age(turbine["turbine_id"])),
+                inspection=Inspection(id=turbine["planification_id"],
+                                        published_date=get_publish_date(turbine["planification_id"])),
+                
+                previous_inspection=Inspection(id=turbine["previous_planification_id"],
+                                                published_date=get_publish_date(turbine["previous_planification_id"])),
+                mean_growth= round(mean(b["length_delta"] for b in turbine["blades"]), 2),
+                blades=[BladeEvolution(
+                                        blade_name=b["blade"],
+                                        evolution_status=b["status"],
+                                        evolution_length=round(b["length_delta"], 2),
+                                        total_eroded_length=round(b["total_eroded_length"], 2),
+                                        growth_percentage=round(b["growth_percentage"], 1),
+                                        spread_to_pressure_side=b["spreads_to_pressure_side"],
+                                        spread_to_suction_side=b["spreads_to_suction_side"],
+                                        previously_spread_to_pressure_side=b["previously_spread_to_pressure_side"],
+                                        previously_spread_to_suction_side=b["previously_spread_to_suction_side"],
+                                    ) for b in turbine["blades"]
+                        ],
+            )
+        )
+        for turbine in turbines_payload
+        if turbine["blades"]
+    ]
+    
+    if site_id:
+        payload = SiteEvolution(
+            site= Site(id=site_id,name=get_site_name(site_id)),
+            turbines= turbines_payload,
+            site_mean_growth_in_meters= round(mean(site_growth), 2) if site_growth else None,
+            site_median_growth_in_meters=round(median(site_growth), 2) if site_growth else None,
+            turbines_never_inspected=[
+                Turbine(id=tid, name=turbine_names.get(tid)) for tid in never_inspected],
+            turbines_without_previous=[
+                Turbine(id=tid, name=turbine_names.get(tid)) for tid in without_previous],
+        )
+    else:
+        payload = turbines_payload
 
-#     current_data_by_inspection = {}
-#     for current_id in set(current_by_turbine[tid] for tid in turbine_ids):
-#         concerned = [tid for tid in turbine_ids if current_by_turbine[tid] == current_id]
-#         current_data_by_inspection[current_id] = fetch_erosion_data_bulk(
-#             current_id, concerned)
+    resp = json.dumps(payload, default=str); print(resp)
+    return resp
+
+
+@tool
+def get_inspection_erosion_details(
+site_id: int,
+inspection_id: int,
+turbine_ids: list[int] | None = None
+) -> str:
+    """Give erosion details for a site. 
+    Details are erosion area size and spreading on Pressure Face and Suction Face, from Leading Edge.
+
+    Use this tool if the user ask for details or a diagnostic on the erosion of a site.
+    
+    Args:
+        site_id: Site for which we want to know erosion details.
+        inspection_id: Inspection for which we want to know erosion details.
+        turbine_ids: Restrict to specific turbines
         
-#     turbines_payload = get_current_data_for_turbines(turbine_ids, current_by_turbine,
-#                                 current_data_by_inspection,
-#                                 blade, include_areas)
-#     turbine_names = resolve_turbine_names(
-#         turbine_ids + never_inspected)
-#     print(turbines_payload)
-#     for entry in turbines_payload:
-#         entry["turbine_name"] = turbine_names.get(entry["turbine_id"])
+    Returns:
+        A list of TurbineErosionDetails, one per turbine, with erosion details by blade.
+    """
+    print("TOOL_CALL get_site_erosion_details", site_id, inspection_id, turbine_ids)
+    
+    ### Ensure to get only concerned turbines
+    
+    TW_DB_CURSOR.execute(" \
+        SELECT turbines.id, turbines.name \
+        FROM planifications \
+        JOIN asset_scope ON asset_scope.planification_id = planifications.id \
+        JOIN turbines ON turbines.id = asset_scope.turbine_id \
+        JOIN sites ON sites.id = turbines.site_id \
+        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
+        LEFT OUTER JOIN fir_records \
+        ON fir_records.planification_id = asset_scope.planification_id AND fir_records.turbine_id = asset_scope.turbine_id \
+        WHERE planifications.deleted_at IS NULL AND asset_scope.deleted_at IS NULL \
+        AND planifications.id = %s AND (fir_records.id IS NULL OR fir_records.deleted_at IS NOT NULL) \
+    ", (GLOBAL_INFOS['CURRENT_COMPANY_ID'], inspection_id, ))
+    
+    concerned_turbines = {}
+    insp_by_turbine = {} # Needed for get_current_data_for_turbines
+    for row in TW_DB_CURSOR:
+        turbine_id, turbine_name = row
+        if not turbine_ids or turbine_id in turbine_ids:
+            concerned_turbines[turbine_id] = Turbine(id=turbine_id, name=turbine_name)
+            insp_by_turbine[turbine_id] = inspection_id
+    
+    turbines_payload = get_current_data_for_turbines(
+        sorted(concerned_turbines), 
+        insp_by_turbine,
+        {inspection_id: fetch_erosion_data_bulk(inspection_id, sorted(concerned_turbines))},
+        None, True
+    )
+    
+    turbine_details = []
+    for turbine_erosion_data in turbines_payload:
+
+        blade_details = {}
+        for blade_erosion_data in turbine_erosion_data['blades']:
+            
+            eroded_areas = []
+            for eroded_area in blade_erosion_data['eroded_areas']:
+
+                if eroded_area['spread_pressure_side'] == 0.0 and eroded_area['spread_suction_side'] == 0.0:
+                    spreading = "Only on the LE"
+                elif eroded_area['spread_pressure_side'] > 0.0:
+                    spreading = "Spread on PS " + str(round(eroded_area['spread_pressure_side'], 2)) + "m"
+                elif eroded_area['spread_suction_side'] > 0.0:
+                    spreading = "Spread on SS " + str(round(eroded_area['spread_suction_side'], 2)) + "m"
+                else:
+                    spreading = "Spread on both PS " + str(round(eroded_area['spread_pressure_side'], 2)) + "m and SS" + str(round(eroded_area['spread_suction_side'], 2)) + "m"
+                
+                eroded_areas.append(ErosionAreaDetails(
+                    severity=eroded_area['max_severity'],
+                    depth=eroded_area['deepest_part'],
+                    length=round(eroded_area['eroded_length'], 2),
+                    radius_start=round(eroded_area['radius_start'], 2),
+                    radius_end=round(eroded_area['radius_end'], 2),
+                    spreading=spreading
+                ))
+            
+            blade_details[blade_erosion_data['blade']] = BladeErosionDetails(
+                total_length=round(blade_erosion_data['total_eroded_length'], 2),
+                laminate_length=round(blade_erosion_data['laminate_length'], 2),
+                eroded_areas=eroded_areas
+            )
         
-#     if site_id:
-#         turbines_payload = [
-#         {
-#             "turbine_id": turbine["turbine_id"],
-#             "turbine_name": turbine["turbine_name"],
-#             "planification_id": turbine["planification_id"],
-#             "turbine_erosion_mean_in_meters": round(
-#                 mean(b["total_eroded_length"] for b in turbine["blades"]), 2),
-#             "turbine_erosion_total_in_meters": round(
-#                 sum(b["total_eroded_length"] for b in turbine["blades"]), 2),
-#             "blades": [turbine["blades"]],
-#         }
-#         for turbine in turbines_payload
-#         if turbine["blades"]
-#         ]
+        print("DEBUG", blade_details)
+        turbine_details.append(TurbineErosionDetails(
+            turbine=concerned_turbines[turbine_erosion_data['turbine_id']],
+            a_details=blade_details['A'] if 'A' in blade_details else 'No erosion',
+            b_details=blade_details['B'] if 'B' in blade_details else 'No erosion',
+            c_details=blade_details['C'] if 'C' in blade_details else 'No erosion'
+        ))
         
-#         payload = {
-#         "inspection_id": inspection_id,
-#         "site_id": site_id,
-#         "site_name":get_site_name(site_id),
-#         "turbines": turbines_payload,
-#         # "site_mean_growth_in_meter": round(mean(site_growth), 2) if site_growth else None,
-#         # "site_median_growth_in_meter": round(median(site_growth), 2) if site_growth else None,
-#         # "turbines_never_inspected": named(never_inspected),
-#         # "turbines_without_previous": named(without_previous),
-#     }
-        
-        
-#     return json.dumps(payload, default=str)
+    resp = str(turbine_details); print(resp)
+    return resp
+    
+@tool
+def get_inspection_crack_details(site_id: int,
+                                 inspection_id: int,
+                                 turbine_ids: list[int] | None = None) -> str:
+    """Give crack details for a site at a given inspection.
+ 
+    Use this when the user asks for details or a diagnostic on the cracks of a
+    site: where they are, how long, how deep, how severe. This describes ONE
+    campaign — for how cracks changed since the previous one, use
+    analyse_crack_evolution instead.
+ 
+    Args:
+        site_id: Site for which we want the crack details.
+        inspection_id: Inspection for which we want the crack details.
+        turbine_ids: Optional. Restricts the answer to these turbines.
+ 
+    Returns:
+        One entry per turbine that has at least one crack, with its blades and,
+        for each crack: its face, its position along the blade in meters, its
+        length, how deep it goes (Coat, Laminate, Bonding line, Tip end), its
+        severity and its WIND index.
+        A turbine or a blade with no crack does not appear at all — an absent
+        turbine is a healthy one, not missing data.
+        Cracks are grouped: several overlapping vertical cracks are reported as
+        one, so damage_id identifies the group and is not stable across campaigns.
+    """
+    print("TOOL_CALL get_inspection_crack_details", site_id, inspection_id, turbine_ids)
+ 
+    # ------------------------------------------------------------------ #
+    # 1. Turbines réellement inspectées
+    #
+    # Le LEFT JOIN sur fir_records écarte les turbines dont l'inspection a
+    # échoué : elles sont dans le périmètre mais n'ont pas de relevé.
+    # ------------------------------------------------------------------ #
+    TW_DB_CURSOR.execute(
+        "SELECT turbines.id, turbines.name "
+        "FROM planifications "
+        "JOIN asset_scope ON asset_scope.planification_id = planifications.id "
+        "JOIN turbines ON turbines.id = asset_scope.turbine_id "
+        "JOIN sites ON sites.id = turbines.site_id "
+        "JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites "
+        "  ON _societes_sites.site_id = sites.id "
+        "LEFT OUTER JOIN fir_records "
+        "  ON fir_records.planification_id = asset_scope.planification_id "
+        " AND fir_records.turbine_id = asset_scope.turbine_id "
+        "WHERE planifications.deleted_at IS NULL AND asset_scope.deleted_at IS NULL "
+        "  AND planifications.id = %s AND sites.id = %s "
+        "  AND (fir_records.id IS NULL OR fir_records.deleted_at IS NOT NULL)",
+        (GLOBAL_INFOS["CURRENT_COMPANY_ID"], inspection_id, site_id),
+    )
+ 
+    turbines_by_id = {}
+    for turbine_id, turbine_name in TW_DB_CURSOR.fetchall():
+        if not turbine_ids or turbine_id in turbine_ids:
+            turbines_by_id[turbine_id] = Turbine(id=turbine_id, name=turbine_name)
+ 
+    if not turbines_by_id:
+        return "ERROR: no inspected turbine found for this site and this inspection"
+ 
+    # ------------------------------------------------------------------ #
+    # 2. Fissures, en une seule requête pour tout le site
+    # ------------------------------------------------------------------ #
+    inspected_turbine_ids = sorted(turbines_by_id)
+    crack_data = fetch_crack_data_bulk(inspection_id, inspected_turbine_ids)
+ 
+    turbines_with_cracks = get_cracks_for_turbines(inspected_turbine_ids, crack_data)
+ 
+    if not turbines_with_cracks:
+        return "No crack found on this site at this inspection."
+ 
+    # ------------------------------------------------------------------ #
+    # 3. Mise en forme
+    # ------------------------------------------------------------------ #
+    turbine_details = []
+ 
+    for turbine in turbines_with_cracks:
+        blade_details = []
+        turbine_cracks_count = 0
+ 
+        for blade in turbine["blades"]:
+            cracks = [
+                CrackDetails(
+                    damage_id=crack["damage_id"],
+                    face=crack["face"],
+                    radius=round(crack["radius"], 2) if crack["radius"] is not None else None,
+                    length=round(crack["size"], 3) if crack["size"] is not None else None,
+                    measured_as=crack["measured_as"],
+                    orientation=crack["orientation"],
+                    shape=crack["shape"],
+                    severity=crack["severity"],
+                    depth=crack["damaged_part"],
+                    wind=crack["wind"],
+                    measure_source=crack["measure_source"],
+                )
+                for crack in blade["cracks"]
+            ]
+ 
+            severities = [c.severity for c in cracks if c.severity is not None]
+ 
+            blade_details.append(BladeCrackDetails(
+                blade=blade["blade"],
+                cracks_count=len(cracks),
+                max_severity=max(severities) if severities else None,
+                cracks=cracks,
+            ))
+            turbine_cracks_count += len(cracks)
+ 
+        turbine_details.append(TurbineCrackDetails(
+            turbine=turbines_by_id[turbine["turbine_id"]],
+            cracks_count=turbine_cracks_count,
+            blades=blade_details,
+        ))
+ 
+    # Les turbines les plus fissurées en tête : c'est presque toujours la question.
+    turbine_details.sort(key=lambda t: t.cracks_count, reverse=True)
+ 
+    return json.dumps([t.model_dump() for t in turbine_details], default=str)

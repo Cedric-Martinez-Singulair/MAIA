@@ -186,8 +186,8 @@ class MAIAChatModel(BaseChatModel):
 ### API PART ###
 
 # En dessous, la détection n'est pas fiable : on préfère ne rien annoncer.
-MIN_CHARS_FOR_DETECTION = 15
-MIN_LANGUAGE_CONFIDENCE = 0.60
+MIN_CHARS_FOR_DETECTION = 10
+MIN_LANGUAGE_CONFIDENCE = 0.40
 
 def detect_language(text: str) -> tuple[str | None, str | None, float | None]:
     """(code ISO, nom, confiance) ou (None, None, None) si peu fiable."""
@@ -298,14 +298,16 @@ async def chat(request: ChatRequest):
     print("USER REQUEST", request.message)
     session_history.append(HumanMessage(content=request.message))
     
+    ###R2CUP2RATION DE LA LANGUE
+    language, language_name, confidence = detect_language(request.message)
     llm_timer_start = time.perf_counter()
     
+    tool_call_limit_reached = False
     try:
         print([type(m).__name__ for m in session_history])
         llm_msg = maia_llm.invoke(session_history)
         
         tool_call_secure_cpt = 0; 
-        tool_call_limit_reached = False
         
         timed_out_deadline = time.perf_counter() + MAX_ANSWER_SECONDS
         timed_out = False
@@ -346,9 +348,15 @@ async def chat(request: ChatRequest):
     print(f"ELAPSED TIME {llm_timer_elapsed:.2f}s")
     
     if tool_call_limit_reached:
-        llm_answer = "This question is too vague. Could you be more specific? For example, which site or which turbine are you asking about?"
+        if language == 'fr':
+            llm_answer = "Cette question est trop vague. Pourriez-vous être plus précis ? Par exemple, de quel site ou de quelle turbine parlez-vous ?"
+        elif language == 'en':
+            llm_answer = "This question is too vague. Could you be more specific? For example, which site or which turbine are you asking about?"
     elif timed_out:
-        llm_answer = "It took too long to answer this question, sorry. Could you be more specific? For example, which site or which turbine are you asking about?"
+        if language == 'fr':
+            llm_answer = "Il a fallu trop de temps pour répondre à cette question, désolé. Pourriez-vous être plus précis ? Par exemple, quel site ou quelle turbine demandez-vous ?"
+        elif language == 'en':
+            llm_answer = "It took too long to answer this question, sorry. Could you be more specific? For example, which site or which turbine are you asking about?"
     else:
         llm_answer = llm_msg.content
     
@@ -369,7 +377,7 @@ async def chat(request: ChatRequest):
             text_file.write(str(session_history))
     ############
     
-    language, language_name, confidence = detect_language(request.message)
+   
     
     return {"answer": llm_answer, "session_id": session_id , "language": [language, language_name, confidence]}
 

@@ -163,6 +163,29 @@ class InspectionDamageListResult(BaseModel):
     turbine_damage_id_lists: list[TurbineDamageListResult] = Field(
         default_factory=list, description='Damage ids list on each turbine associated to the inspection',
     )
+    
+# Erosion details
+
+class ErosionAreaDetails(BaseModel):
+    severity: int = Field(description='Maximum severity for this eroded area')
+    depth: Literal['Coat', 'Laminate'] = Field(description='Precise if the area is coat deep or laminate deep')
+    length: float = Field(description='Erosion area length in meters')
+    radius_start: float = Field(description='Starting erosion radius')
+    radius_end: float = Field(description='Ending erosion radius')
+    spreading: str = Field(description='Describe if the erosion is spreading on pressure side or suction side')
+
+class BladeErosionDetails(BaseModel):
+    total_length: float = Field(description='Total erosion length on this blade in meters')
+    laminate_length: float = Field(description='Total length of eroded laminate on this blade in meters')
+    eroded_areas: list[ErosionAreaDetails] = Field(
+        default_factory=list, description='Eroded areas on this blade',
+    )
+
+class TurbineErosionDetails(BaseModel):
+    turbine: Turbine = Field(description='Turbine on which erosion is detailed')
+    a_details: BladeErosionDetails | Literal['No erosion'] = Field(description='Erosion details for blade A')
+    b_details: BladeErosionDetails | Literal['No erosion'] = Field(description='Erosion details for blade B')
+    c_details: BladeErosionDetails | Literal['No erosion'] = Field(description='Erosion details for blade C')
 
 # Repair cost
 
@@ -253,13 +276,92 @@ class SiteStatus(BaseModel):
     number_of_turbines_with_AEP:int = Field(description="The Number of turbines with AEP loss computed")
     inspection : list[Inspection] = Field(description="The inspection linked to the site status")
 
+#Damage erosion evolution 
+
+class SiteEvolution(BaseModel):
+    site: Site = Field(description='The site where the evolution of damages is covered')
+    turbines : list[TurbineEvolution] = Field(description='The list of turbines with their damages and their evolutions')
+    site_mean_growth_in_meters : float = Field(description='The mean growth of the erosion per turbine on this site')
+    site_median_growth_in_meters : float = Field(description='The median growth of the erosion per turbine on this site')
+    turbines_never_inspected : list[Turbine] |None = Field(default_factory=list,description='The turbines that where never inspected')
+    turbines_without_previous : list[Turbine] |None = Field(default_factory=list,description='The turbine wthath doesn\'t have previous inspection')
+    
+class TurbineEvolution(BaseModel):
+    turbine : Turbine = Field(description='The turbine where the damages evolved')
+    inspection : Inspection = Field(description='The inspection linked to the damages evolution')
+    previous_inspection : Inspection = Field(description='The previous inspection linked to the damages evolution')
+    mean_growth : float = Field(description='The mean growth of the erosion on the turbine')
+    blades : list[BladeEvolution]=Field(description='The breakdown of the blades damages evolution')
+
+class BladeEvolution(BaseModel):
+    blade_name : str = Field(description='The name of the blade')
+    evolution_status :str=  Field(description='The stutatus of the damages evolution')
+    evolution_lenght : float | None = Field(default=None,description='The evolution length')
+    spread_spread_to_pressure_side : bool | None  = Field(default=None,description='does the damages has spread to the pressure side')
+    spread_spread_to_suction_side : bool | None  = Field(default=None,description='does the damages has spread to the suction side')
+    previously_spread_spread_to_pressure_side : bool | None  = Field(default=None,description='does the damages was already spreading to the pressure side')
+    previously_spread_spread_to_suction_side : bool | None  = Field(default=None,description='does the damages was already spreading to the suction side')
+
+class CrackDetails(BaseModel):
+    """Une fissure, telle que relevée à cette inspection."""
+ 
+    damage_id: int = Field(description='Id of this crack in the turbinewatch database')
+    face: str = Field(
+        description='Blade face: Pressure side, Leading Edge, Suction side or Trailing Edge')
+    radius: float | None = Field(
+        default=None, description='Position along the blade, in meters from the root')
+    length: float | None = Field(
+        default=None,
+        description='Crack length in meters. For multibranched and stripes cracks '
+                    'this is an area in square meters instead — see measured_as.')
+    measured_as: str = Field(
+        default='length', description='length (meters) or area (square meters)')
+    orientation: str | None = Field(
+        default=None, description='vertical, horizontal, or null when not recorded')
+    shape: str | None = Field(
+        default=None, description='straight, curved, stripes, multibranched, or null')
+    severity: int | None = Field(default=None, description='Severity, 0 to 5')
+    depth: str | None = Field(
+        default=None,
+        description='How deep the crack goes: Coat, Laminate, Bonding line or Tip end. '
+                    'This drives the repair method.')
+    wind: str | None = Field(
+        default=None, description='WIND index: the predicted risk of worsening')
+    measure_source: str = Field(
+        default='image',
+        description='db when the length was measured by hand, image when computed '
+                    'from the photo. Do not compare two cracks measured differently.')
+ 
+ 
+class BladeCrackDetails(BaseModel):
+    """Bilan des fissures d'une pale."""
+ 
+    blade: str = Field(description='Blade name: A, B or C')
+    cracks_count: int = Field(description='How many cracks on this blade')
+    max_severity: int | None = Field(
+        default=None, description='Highest severity found on this blade')
+    cracks: list[CrackDetails] = Field(
+        default_factory=list, description='One entry per crack')
+ 
+ 
+class TurbineCrackDetails(BaseModel):
+    """Fissures d'une turbine, pale par pale."""
+ 
+    turbine: Turbine = Field(description='The turbine these cracks are on')
+    cracks_count: int = Field(description='How many cracks on the whole turbine')
+    blades: list[BladeCrackDetails] = Field(
+        description='One entry per blade that has at least one crack. A blade with '
+                    'no crack does not appear.')
+ 
+ 
+
 
 
 #### Private functions for tools ####
 
 def get_publish_date(planification_id) -> str:
     """
-        Get the published date from cachebase
+        Get the published date from CacheBase
     Args:
         planification_id (int): the planification_id to get the publish date
     """
@@ -271,15 +373,23 @@ def get_publish_date(planification_id) -> str:
     #TODO attendre que ça fasse pas planter TurbineWatch
     return "Published date unknown"
     
+def get_turbine_age(tid):
+    """
+        Get the turbine age from TW
+    Args:
+        tid (int): The turbine id
+    """
+    TW_DB_CURSOR.execute('SELECT EXTRACT(YEAR FROM AGE(NOW(), entry_service))::INT AS turbine_age FROM turbines WHERE turbines.id =%s',(tid,))
+    age = int(TW_DB_CURSOR.fetchone()[0])
+    if age > 30 : return None
+    return age
+
 def get_site_name(site_id):
     """
-        Get the site name from cachebase
+        Get the site name from TW
     Args:
         site_id (int): the site_id to get the site name
     """
-    # CB_DB_CURSOR.execute("SELECT DISTINCT snam FROM prepared_reports_by_campaign WHERE sid = %s", (site_id, ))
-    # site_name = CB_DB_CURSOR.fetchone()
-    # return str(site_name)
-    
-    #TODO attendre que ça fasse pas planter TurbineWatch
-    return "Site name unknown"
+    TW_DB_CURSOR.execute("SELECT sites.name FROM sites WHERE sites.id = %s", (site_id, ))
+    site_name = TW_DB_CURSOR.fetchone()
+    return str(site_name)

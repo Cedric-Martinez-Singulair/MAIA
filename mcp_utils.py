@@ -20,8 +20,9 @@ MAIA_TOOLS = [
     aep_loss_on_a_site_for_each_turbine,
     aep_loss_on_a_turbine,
     analyse_crack_evolution,
-    # analyse_erosion_evolution,
-    # analyse_erosion,
+    analyse_erosion_evolution,
+    get_inspection_erosion_details,
+    get_inspection_crack_details,
     
     count_turbines,
     
