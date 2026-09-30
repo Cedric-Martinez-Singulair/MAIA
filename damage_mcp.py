@@ -1,11 +1,13 @@
 import json
 from statistics import mean
 
+from pydantic import TypeAdapter
 from langchain_core.tools import tool
 from maia_utils import *
 from aep_utils import get_aep_loss_turbine
 from wind.wind_calculator import WINDCalculator
 from stats_utils import *
+from damage_utils import *
 
 from typing import Literal
 from dataclasses import asdict
@@ -56,6 +58,8 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
 
     Use this for aggregate questions about damages on the whole turbine population, a country or a turbine model. 
     It does NOT return individual turbine names — for that, use count_damage_on_a_site_turbines instead.
+    
+    You can get damage_type_id with the tool get_damage_type_ids.
 
     Args:
         damage_type_id: Id of the damage type to count.
@@ -83,13 +87,21 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
         JOIN turbines ON turbines.id = incident_records.turbine_id \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         JOIN sites ON sites.id = turbines.site_id \
-        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
         JOIN countries ON countries.id = sites.country_id \
         JOIN models ON models.id = turbines.model_name \
         WHERE incident_records.dismissed = FALSE AND incident_records.decision_id != 0 AND incident_records.deleted_at IS NULL AND turbines.deleted_at IS NULL AND sites.deleted_at IS NULL \
         AND incident_records.defect_type_id = %s \
     "
-    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], damage_type_id]
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str += "AND incident_records.priority_id <> 5 "
+    
+    req_params = [damage_type_id]
+    
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] != 5:
+        req_str += "AND planifications.societe_id = %s "
+        req_params.append(GLOBAL_INFOS['CURRENT_COMPANY_ID'])
+    elif client_id is not None:
+        req_str += "AND planifications.societe_id = %s "
+        req_params.append(client_id)
     
     if country_id is not None:
         req_str += "AND sites.country_id = %s "; req_params.append(country_id)
@@ -127,10 +139,15 @@ avg_type: Literal["country", "turbine_model", "turbine_age"] | None = None
     
     if avg_type is not None:
         for avg_key in raw_damage_counts:
-             damage_counts[avg_key] = round(mean(raw_damage_counts[avg_key]), 2)
+             damage_counts[str(avg_key)] = round(mean(raw_damage_counts[avg_key]), 2)
     
-    print("--- RES", damage_counts)
-    return str(damage_counts)
+    if isinstance(damage_counts, list):
+        resp = TypeAdapter(list[int]).dump_json(damage_counts).decode()
+    else:
+        resp = TypeAdapter(dict[str, float]).dump_json(damage_counts).decode()
+    
+    print("--- RES ", resp)
+    return resp
 
 DamageAggregation = Literal["damage_type", "blade_component", "severity"]
 @tool
@@ -150,6 +167,8 @@ turbine_ids: list[int] | None = None,
     
     An inspection is an inspection campaign carried out on the site at a given date.
     If location_precision is radius you must filter on a damage type with damage_type_id.
+    
+    You can get damage_type_id with the tool get_damage_type_ids.
     
     Args:
         site_id: The site whose turbines are counted.
@@ -188,9 +207,7 @@ turbine_ids: list[int] | None = None,
         FROM incident_records \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
-        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
     "
-    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID']]
     
     if location_precision in ['blade', 'face', 'radius']: req_str += "JOIN components_turbines ON components_turbines.id = incident_records.component_turbine_id "
     if location_precision in ['face', 'radius']: req_str += "JOIN parts ON parts.id = incident_records.part_id "
@@ -202,7 +219,13 @@ turbine_ids: list[int] | None = None,
         WHERE incident_records.dismissed = FALSE AND incident_records.decision_id != 0 AND incident_records.deleted_at IS NULL AND turbines.deleted_at IS NULL AND planifications.deleted_at IS NULL \
             AND turbines.site_id = %s \
     "
-    req_params.append(site_id)
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str += "AND incident_records.priority_id <> 5 "
+    
+    req_params = [site_id]
+    
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] != 5:
+        req_str += "AND planifications.societe_id = %s "
+        req_params.append(GLOBAL_INFOS['CURRENT_COMPANY_ID'])
     
     if inspection_id is not None:
         req_str += "AND incident_records.planification_id = %s "; req_params.append(inspection_id)
@@ -234,6 +257,7 @@ turbine_ids: list[int] | None = None,
     req_str = req_str[:-2] # Remove the last comma
     req_str += " ORDER BY planifications.id, turbines.id "
     
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str = req_str.replace("criticality_id", "priority_id")
     print("--- REQ", req_str, req_params)
     TW_DB_CURSOR.execute(req_str, req_params)
     
@@ -284,42 +308,58 @@ turbine_ids: list[int] | None = None,
             damage_count=record['damage_count']
         ))
         dmg_count_group_cpt += 1
-        
+    
+    # Security block
     if dmg_count_group_cpt > 100:
         resp = "There is too much data to analyse.\n"
         if damage_type_id == None or severities == None:
             resp += "If you can, use the damage filter parameters (damage_type_id, severities) to reduce the data.\n"
         if location_precision != 'turbines':
             resp += "You can propose to the user to use a less precise location than." + location_precision + "\n"
+        
         if turbine_ids == None:
-            resp += "You can propose to the user to look at a specific turbine.\n"
+            resp += "Try to call this tool with a subgroup of turbines.\n"
+        elif len(turbine_ids) > 1:
+            resp += "Try to call this tool turbine by turbine.\n"
+        
         print("--- RES", resp); return resp
-    
-    print("--- RES", damage_counts)
-    return str(damage_counts)
+
+
+    resp = TypeAdapter(list[InspectionDamageCountResult]).dump_json(damage_counts).decode(); print("--- RES ", resp)
+    return resp
 
 # TODO prendre en compte si la turbine est Approved ou non
 @tool
 def estimate_repair_cost(
 inspection_id: int,
-turbine_id: int | None = None,
+turbine_ids: list[int] | None = None,
 damage_type_id: int | None = None,
 ) -> str:
     '''Estimate the cost of repairing the damages reported at one inspection.
     
-    Covers a single inspection of a single site.
+    Use this when the user ask about repair cost fo a site or turbines.
+    Explain the calcul details in your answer.
+    
+    You can get damage_type_id with the tool get_damage_type_ids.
     
     Args:
         inspection_id: The inspection whose damages are priced.
-        turbine_id: Restrict the estimate to one turbine of that site.
+        turbine_ids: Restrict to some turbines of that site.
         damage_type_id: Restrict the estimate to one damage type.
-        
+    
     Returns:
-        A list of TurbineRepairCost, one per turbine with damage to repair. Each turbine holds its
-        damages grouped by (severity, damage type), with the number of damages in
-        the group and the estimated repair cost for that group, in USD. No overall
-        total is provided — sum the groups if needed.'''
-    print("TOOL_CALL estimate_repair_cost", inspection_id, turbine_id, damage_type_id)
+        A dict object organized like this:
+        total_cost: Total repair cost for the asked inspection or turbines (in €)
+        turbine_costs: A list of TurbineRepairCost, one per turbine with damage to repair. Each turbine holds its
+            damages grouped by (severity, damage type), with the number of damages in
+            the group and the estimated repair cost for that group, in €. No overall
+            total is provided — sum the groups if needed.'''
+    print("TOOL_CALL estimate_repair_cost", inspection_id, turbine_ids, damage_type_id)
+    
+    #TODO faire en sorte d'avoir des données pour ENERCON
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15:
+        resp = "This tool does not work for this company."; print("--- RES", resp)
+        return str(resp)
     
     general_cost_by_sev = {}
     TW_DB_CURSOR.execute("SELECT * FROM sesame_damage_general_cost")
@@ -342,59 +382,83 @@ damage_type_id: int | None = None,
         FROM incident_records \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
-        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
         JOIN defect_types ON defect_types.id = incident_records.defect_type_id \
         WHERE incident_records.planification_id = %s \
     "
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str += "AND incident_records.priority_id <> 5 "
     
-    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], inspection_id]
+    req_params = [inspection_id]
     
-    if turbine_id is not None:
-        req_str += "AND incident_records.turbine_id = %s "; req_params.append(turbine_id)
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] != 5:
+        req_str += "AND planifications.societe_id = %s "
+        req_params.append(GLOBAL_INFOS['CURRENT_COMPANY_ID'])
+    
+    if turbine_ids is not None and len(turbine_ids) > 0 :
+        req_str += "AND turbines.id IN ("
+        for turbine_id in turbine_ids:
+            req_str += "%s, "; req_params.append(turbine_id)
+        req_str = req_str[:-2] + ") "
+    
     if damage_type_id is not None:
         req_str += "AND incident_records.defect_type_id = %s "; req_params.append(damage_type_id)
         
     req_str += " \
         GROUP BY turbines.id, turbines.name, defect_types.id, defect_types.label_en, incident_records.criticality_id \
-        ORDER BY turbines.id \
+        ORDER BY turbines.id, defect_types.id, incident_records.criticality_id DESC \
     "
     
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str = req_str.replace("criticality_id", "priority_id")
     print("--- REQ", req_str, req_params)
     TW_DB_CURSOR.execute(req_str, req_params)
     
+    #TODO calculer le repair cost à la turbine
+    
+    total_cost = 0.0
     turbine_repair_costs = []
     found_turbine_id = []
+    found_damage_type_id = []
     for row in TW_DB_CURSOR:
         turbine_id, turbine_name, row_damage_type_id, damage_type, severity_id, damage_count = row
         true_severity = severity_id
         if true_severity == 6: true_severity = 0
         
         if severity_id in general_cost_by_sev:
+            if turbine_id not in found_turbine_id:
+                found_turbine_id.append(turbine_id)
+                turbine_repair_costs.append(TurbineRepairCost(
+                    turbine=Turbine(id=turbine_id, name=turbine_name),
+                    total_repair_cost=0.0,
+                    damage_group_repair_cost=[]
+                ))
+                found_damage_type_id = []
+            
             coef_damage_count = damage_count
             if coef_damage_count > damage_cost_coef_max_count:
                 coef_damage_count = damage_cost_coef_max_count
             repair_cost = general_cost_by_sev[severity_id] * damage_cost_coefs[coef_damage_count]
             
-            explanation = "The base cost for this damage severity is " + str(general_cost_by_sev[severity_id])
-            explanation += " and since there is " + str(damage_count) + " damage it's multiplied by " + str(damage_cost_coefs[coef_damage_count])
-            
-            if turbine_id not in found_turbine_id:
-                found_turbine_id.append(turbine_id)
-                turbine_repair_costs.append(TurbineRepairCost(
-                    turbine=Turbine(id=turbine_id, name=turbine_name),
-                    damage_group_repair_cost=[]
+            if row_damage_type_id not in found_damage_type_id:
+                found_damage_type_id.append(row_damage_type_id)
+                
+                explanation = "The base cost for this damage severity is " + str(general_cost_by_sev[severity_id])
+                explanation += " and since there is " + str(damage_count) + " damage it's multiplied by " + str(damage_cost_coefs[coef_damage_count])
+                turbine_repair_costs[-1].damage_group_repair_cost.append(DamageGroupRepairCost(
+                    max_severity=true_severity,
+                    damage_type=DamageType(id=row_damage_type_id, name=damage_type),
+                    damage_count=damage_count,
+                    repair_cost=repair_cost,
+                    explanation=explanation
                 ))
-            
-            turbine_repair_costs[-1].damage_group_repair_cost.append(DamageGroupRepairCost(
-                severity=true_severity,
-                damage_type=DamageType(id=row_damage_type_id, name=damage_type),
-                damage_count=damage_count,
-                repair_cost=repair_cost,
-                explanation=explanation
-            ))
+                turbine_repair_costs[-1].total_repair_cost += repair_cost
+                total_cost += repair_cost
+            else:
+                turbine_repair_costs[-1].damage_group_repair_cost[-1].damage_count += damage_count
+            # Don't need to update because its ORDER with the higher severity first
+
+    result = {'total_cost': total_cost, 'turbine_costs': turbine_repair_costs}
     
-    print("--- RES", turbine_repair_costs)
-    return str(turbine_repair_costs)
+    resp = TypeAdapter(dict[str, float]).dump_json(result).decode(); print("--- RES ", resp)
+    return resp
 
 @tool
 def get_individual_damage_infos(individual_damage_id: int) -> str:
@@ -423,13 +487,18 @@ def get_individual_damage_infos(individual_damage_id: int) -> str:
         JOIN components_turbines ON components_turbines.id = incident_records.component_turbine_id  \
         JOIN turbines ON turbines.id = incident_records.turbine_id \
         JOIN sites ON sites.id = turbines.site_id \
-        JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = sites.id \
         JOIN planifications ON planifications.id = incident_records.planification_id \
         WHERE incident_records.id = %s \
     "
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str += "AND incident_records.priority_id <> 5 "
     
-    req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id]
+    req_params = [individual_damage_id]
     
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] != 5:
+        req_str += "AND planifications.societe_id = %s "
+        req_params.append(GLOBAL_INFOS['CURRENT_COMPANY_ID'])
+    
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str = req_str.replace("criticality_id", "priority_id")
     print("--- REQ", req_str, req_params)
     TW_DB_CURSOR.execute(req_str, req_params)
     for row in TW_DB_CURSOR:
@@ -451,9 +520,9 @@ def get_individual_damage_infos(individual_damage_id: int) -> str:
         ),
         wind=wind_calculator.getDmgWIND({"wind": wind, "wind_severity": wind_severity, "wind_desc": wind_desc, "wind_new_desc": wind_new_desc, "wind_new_sev": wind_new_sev})
     )
-    
-    print("--- RES", damage_infos)
-    return str(damage_infos)
+
+    resp = TypeAdapter(Damage).dump_json(damage_infos).decode(); print("--- RES ", resp)
+    return resp
 
 @tool
 def estimate_damage_repair_frequency(individual_damage_id) -> str:
@@ -485,9 +554,11 @@ def estimate_damage_repair_frequency(individual_damage_id) -> str:
         JOIN (SELECT site_id FROM societes_sites WHERE societe_id = %s) _societes_sites ON _societes_sites.site_id = turbines.site_id \
         WHERE incident_records.id = %s \
     "
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str += "AND incident_records.priority_id <> 5 "
     
     req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id]
     
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str = req_str.replace("criticality_id", "priority_id")
     print("--- REQ", req_str, req_params)
     TW_DB_CURSOR.execute(req_str, req_params)
     for row in TW_DB_CURSOR:
@@ -504,9 +575,11 @@ def estimate_damage_repair_frequency(individual_damage_id) -> str:
         AND incident_records.component_id = %s AND incident_records.defect_type_id = %s AND incident_records.criticality_id = %s \
         AND incident_records.part_id = %s AND incident_records.radius = %s AND turbines.model_name = %s \
     "
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str += "AND incident_records.priority_id <> 5 "
     
     req_params = [GLOBAL_INFOS['CURRENT_COMPANY_ID'], individual_damage_id, part_damaged_id, damage_type_id, severity_id, face_id, radius, model_id]
     
+    if GLOBAL_INFOS['CURRENT_COMPANY_ID'] == 15: req_str = req_str.replace("criticality_id", "priority_id")
     print("--- REQ", req_str, req_params)
     TW_DB_CURSOR.execute(req_str, req_params)
     
@@ -537,9 +610,11 @@ def estimate_damage_repair_frequency(individual_damage_id) -> str:
             for row in TW_DB_CURSOR:
                 total_data += 1
                 if row[0] is None: total_repaired += 1
+
+    result = {'total_data': total_data, 'total_repaired': total_repaired}
     
-    print("--- RES", total_data, total_repaired)
-    return str({'total_data': total_data, 'total_repaired': total_repaired})
+    resp = TypeAdapter(dict[str, int]).dump_json(result).decode(); print("--- RES ", resp)
+    return resp
 
 
 # Pale visée -> pales à exclure du calcul (paramètre not_blades)
@@ -553,7 +628,7 @@ BLADE_LAYOUT = {
 def aep_loss_on_a_site_for_each_turbine(site_id: int,
 inspection_id: int | None = None,
 aep_loss_blade_needed: bool = False,
-criticality: int | None = None) -> str:
+severity: int | None = None) -> str:
     '''Get the AEP (Annual Energy Production) loss of a site and of each of its turbines.
 
     Use this when the user asks how much energy a site is losing, which turbines
@@ -577,7 +652,7 @@ criticality: int | None = None) -> str:
         aep_loss_blade_needed: Optional, default False. Adds a per-blade breakdown 
             (blades A, B and C) to every turbine. Slow — only set it True when the
             user asks about blades specifically.
-        criticality: Optional. Damage criticality level, taken from the user's own
+        severity: Optional. Damage criticality level, taken from the user's own
             request — pass it only when the user explicitly names a criticality
             level, and pass exactly the level they asked for. Never guess a value
             and never pass a default: when the user says nothing about criticality,
@@ -598,15 +673,10 @@ criticality: int | None = None) -> str:
         given.
     '''
     print("TOOL_CALL aep_loss_on_a_site_for_each_turbine",
-          site_id, inspection_id, aep_loss_blade_needed, criticality)
+          site_id, inspection_id, aep_loss_blade_needed, severity)
+    result = False
 
-    # ------------------------------------------------------------------ #
-    # 1. Résolution de l'inspection
-    #
-    # On la résout AVANT la requête principale : les appels imbriqués à
-    # get_aep_loss_turbine doivent porter sur la même inspection que les
-    # chiffres du site, sinon le détail par pale ne correspond pas au total.
-    # ------------------------------------------------------------------ #
+
     if inspection_id is None:
         TW_DB_CURSOR.execute(
             "SELECT MAX(planification_id) FROM aep_loss WHERE site_id = %s",
@@ -640,86 +710,97 @@ criticality: int | None = None) -> str:
     )
     TW_DB_CURSOR.execute(req_str, (site_id, resolved_planification_id))
     rows = TW_DB_CURSOR.fetchall()
-
+    
     if not rows:
-        return "ERROR: no AEP loss data for this site"
+        result = "ERROR: no AEP loss data for this site"
 
-    # ------------------------------------------------------------------ #
-    # 3. Calculs par pale
-    #
-    # Une turbine = 3 calculs (6 avec criticality), quel que soit le nombre de
-    # lignes qu'elle occupe dans le résultat SQL.
-    # ------------------------------------------------------------------ #
-    blade_results: dict[tuple[int, str, bool], float] = {}
+    if len(rows) > 6 and aep_loss_blade_needed:
+        result = "WARNING: blade data will be too long to compute call the tool again with aep_loss_blade_needed=False"
+    
+    
+    if not result:
+        # ------------------------------------------------------------------ #
+        # 3. Calculs par pale
+        #
+        # Une turbine = 3 calculs (6 avec criticality), quel que soit le nombre de
+        # lignes qu'elle occupe dans le résultat SQL.
+        # ------------------------------------------------------------------ #
+        blade_results: dict[tuple[int, str, bool], float] = {}
 
-    if aep_loss_blade_needed:
-        turbine_ids = sorted({row[0] for row in rows})
+        if aep_loss_blade_needed:
+            turbine_ids = sorted({row[0] for row in rows})
 
-        tasks = []
-        for turbine_id in turbine_ids:
-            for blade, not_blades in BLADE_LAYOUT.items():
-                blade_results[(turbine_id, blade, False)] = get_aep_loss_turbine(
-                    site_id=site_id,
-                    planification_id=resolved_planification_id,
-                    turbine_id=turbine_id,
-                    not_blades=not_blades,
-                    criticality_id=None,
-                )["AEP_loss_Jensen"]
- 
-                if criticality is not None:
-                    blade_results[(turbine_id, blade, True)] = get_aep_loss_turbine(
+            tasks = []
+            for turbine_id in turbine_ids:
+                for blade, not_blades in BLADE_LAYOUT.items():
+                    blade_results[(turbine_id, blade, False)] = get_aep_loss_turbine(
                         site_id=site_id,
                         planification_id=resolved_planification_id,
                         turbine_id=turbine_id,
                         not_blades=not_blades,
-                        criticality_id=criticality,
+                        criticality_id=None,
                     )["AEP_loss_Jensen"]
- 
-    # ------------------------------------------------------------------ #
-    # 4. Construction du résultat
-    # ------------------------------------------------------------------ #
-    aep_loss_turbines = []
-    aep_loss_site = 0.0
-    site_name = ""
-    inspection_date = ""
+    
+                    if severity is not None:
+                        blade_results[(turbine_id, blade, True)] = get_aep_loss_turbine(
+                            site_id=site_id,
+                            planification_id=resolved_planification_id,
+                            turbine_id=turbine_id,
+                            not_blades=not_blades,
+                            criticality_id=severity,
+                        )["AEP_loss_Jensen"]
+    
+        # ------------------------------------------------------------------ #
+        # 4. Construction du résultat
+        # ------------------------------------------------------------------ #
+        aep_loss_turbines = []
+        aep_loss_site = 0.0
+        site_name = ""
+        inspection_date = ""
 
-    for turbine_id, aep_loss_jensen, turbine_name, site_name, inspection_date in rows:
-        blade_aep_loss = None
-        if aep_loss_blade_needed:
-            blade_aep_loss = [
-                BladeAEPLoss(
-                    blade=blade,
-                    aep_loss_blade=blade_results.get((turbine_id, blade, False)),
-                    aep_loss_blade_repair=blade_results.get((turbine_id, blade, True)),
+        for turbine_id, aep_loss_jensen, turbine_name, site_name, inspection_date in rows:
+            blade_aep_loss = None
+            if aep_loss_blade_needed:
+                blade_aep_loss = [
+                    BladeAEPLoss(
+                        blade=blade,
+                        aep_loss_blade=blade_results.get((turbine_id, blade, False)),
+                        aep_loss_blade_repair=blade_results.get((turbine_id, blade, True)),
+                    )
+                    for blade in BLADE_LAYOUT  # dict ordonné : A, B, C
+                ]
+
+            aep_loss_turbines.append(
+                TurbineAEPLoss(
+                    turbine=Turbine(id=turbine_id, name=turbine_name),
+                    blade_aep_loss=blade_aep_loss,
+                    aep_loss=round(aep_loss_jensen,2),
                 )
-                for blade in BLADE_LAYOUT  # dict ordonné : A, B, C
-            ]
-
-        aep_loss_turbines.append(
-            TurbineAEPLoss(
-                turbine=Turbine(id=turbine_id, name=turbine_name),
-                blade_aep_loss=blade_aep_loss,
-                aep_loss=aep_loss_jensen,
             )
+            aep_loss_site += float(aep_loss_jensen)
+
+        result = SiteAEPLoss(
+            site=Site(id=site_id, name=str(site_name)),
+            inspection=Inspection(
+                id=resolved_planification_id, published_date=str(get_publish_date(resolved_planification_id))
+            ),
+            aep_loss_site=aep_loss_site,
+            aep_loss_turbines=aep_loss_turbines,
         )
-        aep_loss_site += float(aep_loss_jensen)
-
-    result = SiteAEPLoss(
-        site=Site(id=site_id, name=str(site_name)),
-        inspection=Inspection(
-            id=resolved_planification_id, published_date=str(get_publish_date(resolved_planification_id))
-        ),
-        aep_loss_site=aep_loss_site,
-        aep_loss_turbines=aep_loss_turbines,
-    )
-
-    return result.model_dump_json()
+    
+    if type(result) == str:
+        resp = TypeAdapter(str).dump_json(result).decode()
+    else:
+        resp = TypeAdapter(SiteAEPLoss).dump_json(result).decode()
+        
+    print("---RES", resp)
+    return resp 
 
 @tool
 def aep_loss_on_a_turbine(turbine_id: int,
 inspection_id: int | None = None,
 aep_loss_blade_needed: bool = False,
-criticality: int | None = None) -> str:
+severity: int | None = None) -> str:
     '''Get the AEP (Annual Energy Production) loss of one single turbine.
 
     Use this whenever the question is about one turbine — how much energy it is
@@ -742,7 +823,7 @@ criticality: int | None = None) -> str:
         aep_loss_blade_needed: Optional, default False. Adds the per-blade
             breakdown (blades A, B and C). It runs three extra computations, so
             leave it False when the turbine total is enough.
-        criticality: Optional. Damage criticality level, taken from the user's own
+        severity: Optional. Damage criticality level, taken from the user's own
             request — pass it only when the user explicitly names a criticality
             level, and pass exactly the level they asked for. Never guess a value
             and never pass a default: when the user says nothing about criticality,
@@ -758,7 +839,7 @@ criticality: int | None = None) -> str:
         its individual loss, plus the post-repair loss when criticality was given.
     '''
     print("TOOL_CALL aep_loss_on_a_turbine",
-          turbine_id, inspection_id, aep_loss_blade_needed, criticality)
+          turbine_id, inspection_id, aep_loss_blade_needed, severity)
 
     # ------------------------------------------------------------------ #
     # 1. Résolution de la inspection
@@ -816,20 +897,20 @@ criticality: int | None = None) -> str:
         for blade, not_blades in BLADE_LAYOUT.items():
             current = get_aep_loss_turbine(
                 site_id=site_id,
-                inspection_id=resolved_planification_id,
+                planification_id=resolved_planification_id,
                 turbine_id=turbine_id,
                 not_blades=not_blades,
                 criticality_id=None,
             )["AEP_loss_Jensen"]
 
             repaired = None
-            if criticality is not None:
+            if severity is not None:
                 repaired = get_aep_loss_turbine(
                     site_id=site_id,
-                    inspection_id=resolved_planification_id,
+                    planification_id=resolved_planification_id,
                     turbine_id=turbine_id,
                     not_blades=not_blades,
-                    criticality_id=criticality,
+                    criticality_id=severity,
                 )["AEP_loss_Jensen"]
 
             blade_aep_loss.append(BladeAEPLoss(
@@ -846,7 +927,8 @@ criticality: int | None = None) -> str:
         blade_aep_loss=blade_aep_loss,
         aep_loss=round(aep_loss_jensen,2),
     )
-
+    print(turbine_result)
+    
     return json.dumps({
         "site": Site(id=site_id, name=str(site_name)).model_dump(),
         "inspection": Inspection(
@@ -854,82 +936,6 @@ criticality: int | None = None) -> str:
         ).model_dump(),
         "turbine": turbine_result.model_dump(),
     }, default=str)
-
-@tool
-def analyse_crack_evolution(turbine_id: int,
-inspection_id: int,
-previous_inspection_id: int | None = None,
-blade: str | None = None,
-only_changed: bool = False) -> str:
-    '''Tell how the cracks of a turbine evolved between two inspection campaigns.
- 
-    Use this when the user asks whether a crack grew, whether damages got worse
-    on a turbine, what changed since the last inspection, or which cracks were
-    repaired.
- 
-    Args:
-        turbine_id: Identifier of the turbine to analyse.
-        inspection_id: The campaign to look at.
-        previous_inspection_id: Optional. The campaign to compare against.
-            When omitted, the campaign right before inspection_id is used.
-        blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
-        only_changed: Set True to drop unchanged cracks
-            and keep only what is new, grown or repaired.
- 
-    Returns:
-        The two campaigns compared, and one entry per crack with its blade, face,
-        radius, shape, severity and WIND index, its current and previous size in
-        meters, and a status: new (absent before), grown, stable, or repaired
-        (present before, gone now).
-
-        Sizes are lengths in meters, except for multibranched and stripes cracks
-        which are areas in square meters and are not compared. Each entry also
-        states whether its size comes from a manual measurement or from the image:
-        a delta between two different sources is not reliable. growth_was_predicted
-        marks a crack whose WIND index had already forecast the growth.
-    '''
-    print("TOOL_CALL analyse_crack_evolution", turbine_id, inspection_id,
-          previous_inspection_id, blade, only_changed)
- 
-    if previous_inspection_id is None:
-        previous_inspection_id = resolve_previous_planification(turbine_id, inspection_id)
-        if previous_inspection_id is None:
-            res = "ERROR: no earlier inspection campaign with damages for this turbine, there is nothing to compare with"
-            print(res)
-            return res
- 
-    full_data = fetch_crack_data(inspection_id, turbine_id)
-    previous_full_data = fetch_crack_data(previous_inspection_id, turbine_id)
- 
-    evolutions = []
- 
-    for current_blade in ([blade] if blade else BLADES):
-        blade_data = select_blade(full_data, current_blade)
-        previous_blade_data = select_blade(previous_full_data, current_blade)
- 
-        if blade_data.empty and previous_blade_data.empty:
-            continue
- 
-        #TODO vérifier si les cracks qui ont "rétrécis" sont remontés ou pas, c'est pas clair
-        evolutions.extend(compare_blade_cracks(
-            build_cracks_by_face(blade_data),
-            build_cracks_by_face(previous_blade_data),
-            current_blade,
-        ))
- 
-    if only_changed:
-        evolutions = [e for e in evolutions if e.status != "stable"]
- 
-    #TODO mettre toutes les infos
-    res = json.dumps({
-        "turbine_id": turbine_id,
-        "inspection_id": inspection_id,
-        "previous_inspection_id": previous_inspection_id,
-        "cracks": [asdict(e) for e in evolutions],
-    }, default=str)
- 
-    print("-- RES", res)
-    return res
 
 @tool
 def analyse_erosion_evolution(
@@ -1030,7 +1036,10 @@ include_areas: bool = True) -> str:
         return "ERROR: give either turbine_id or site_id"
     if turbine_id and site_id:
         return "ERROR: give turbine_id or site_id, not both"
-
+    asked_for_turbine = False
+    if turbine_id:
+        asked_for_turbine=True
+    
     # ------------------------------------------------------------------ #
     # 1. Turbines concernées, et campagne courante de chacune
     #
@@ -1114,45 +1123,52 @@ include_areas: bool = True) -> str:
         "previously_spread_to_pressure_side", "previously_spread_to_suction_side",
     ]
 
-    def slim_blade(blade):
-        print(blade.keys())
-        slim = {}
-        for key in BLADE_KEYS:
-            value = blade.get(key)
-            slim[key] = round(value, 2) if isinstance(value, float) else value
-        return slim
+    # def slim_blade(blade):
+    #     print(blade.keys())
+    #     slim = {}
+    #     for key in BLADE_KEYS:
+    #         value = blade.get(key)
+    #         slim[key] = round(value, 2) if isinstance(value, float) else value
+    #     return slim
+    blades_cpt = 0
     
-    
-
     turbines_payload = [
         (
             TurbineEvolution(
                 turbine = Turbine(id=turbine["turbine_id"],
-                                    name= turbine["turbine_name"],
+                                    name=turbine["turbine_name"],
                                     age=get_turbine_age(turbine["turbine_id"])),
                 inspection=Inspection(id=turbine["planification_id"],
                                         published_date=get_publish_date(turbine["planification_id"])),
                 
                 previous_inspection=Inspection(id=turbine["previous_planification_id"],
                                                 published_date=get_publish_date(turbine["previous_planification_id"])),
-                mean_growth= round(mean(b["length_delta"] for b in turbine["blades"]), 2),
                 blades=[BladeEvolution(
-                                        blade_name=b["blade"],
-                                        evolution_status=b["status"],
-                                        evolution_length=round(b["length_delta"], 2),
-                                        total_eroded_length=round(b["total_eroded_length"], 2),
-                                        growth_percentage=round(b["growth_percentage"], 1),
-                                        spread_to_pressure_side=b["spreads_to_pressure_side"],
-                                        spread_to_suction_side=b["spreads_to_suction_side"],
-                                        previously_spread_to_pressure_side=b["previously_spread_to_pressure_side"],
-                                        previously_spread_to_suction_side=b["previously_spread_to_suction_side"],
-                                    ) for b in turbine["blades"]
+                                        blade_name=blade_datas["blade"],
+                                        evolution_status=blade_datas["status"],
+                                        evolution_length=round(blade_datas["length_delta"], 2),
+                                        total_eroded_length=round(blade_datas["total_eroded_length"], 2),
+                                        spread_to_pressure_side=blade_datas["spreads_to_pressure_side"],
+                                        spread_to_suction_side=blade_datas["spreads_to_suction_side"],
+                                        previously_spread_to_pressure_side=blade_datas["previously_spread_to_pressure_side"],
+                                        previously_spread_to_suction_side=blade_datas["previously_spread_to_suction_side"],
+                                    ) for blade_datas in turbine["blades"]
                         ],
+                mean_growth= round(turbine["turbine_mean_growth_in_meters"], 2),
             )
         )
         for turbine in turbines_payload
         if turbine["blades"]
     ]
+    if asked_for_turbine and len(turbines_payload) > 1:
+        for turbine in turbines_payload:
+            blades_cpt+=len(turbine["blades"])
+
+    if blades_cpt > 100:
+        resp = "There is too much data to analyse.\n"
+        if asked_for_turbine:
+            resp += "You can propose to the user to look at a specific turbine or a specific set of turbines.\n"
+        print("--- RES", resp); return resp
     
     if site_id:
         payload = SiteEvolution(
@@ -1165,12 +1181,13 @@ include_areas: bool = True) -> str:
             turbines_without_previous=[
                 Turbine(id=tid, name=turbine_names.get(tid)) for tid in without_previous],
         )
+        resp = TypeAdapter(SiteEvolution).dump_json(payload).decode()
     else:
         payload = turbines_payload
-
-    resp = json.dumps(payload, default=str); print(resp)
+        resp = TypeAdapter(list[TurbineEvolution]).dump_json(payload).decode()
+    
+    print(resp)
     return resp
-
 
 @tool
 def get_inspection_erosion_details(
@@ -1178,7 +1195,7 @@ site_id: int,
 inspection_id: int,
 turbine_ids: list[int] | None = None
 ) -> str:
-    """Give erosion details for a site. 
+    """Give erosion details for a site at a given inspection.
     Details are erosion area size and spreading on Pressure Face and Suction Face, from Leading Edge.
 
     Use this tool if the user ask for details or a diagnostic on the erosion of a site.
@@ -1191,7 +1208,7 @@ turbine_ids: list[int] | None = None
     Returns:
         A list of TurbineErosionDetails, one per turbine, with erosion details by blade.
     """
-    print("TOOL_CALL get_site_erosion_details", site_id, inspection_id, turbine_ids)
+    print("TOOL_CALL get_inspection_erosion_details", site_id, inspection_id, turbine_ids)
     
     ### Ensure to get only concerned turbines
     
@@ -1224,11 +1241,12 @@ turbine_ids: list[int] | None = None
     )
     
     turbine_details = []
+    eroded_ares_cpt = 0
     for turbine_erosion_data in turbines_payload:
 
         blade_details = {}
         for blade_erosion_data in turbine_erosion_data['blades']:
-            
+
             eroded_areas = []
             for eroded_area in blade_erosion_data['eroded_areas']:
 
@@ -1241,14 +1259,16 @@ turbine_ids: list[int] | None = None
                 else:
                     spreading = "Spread on both PS " + str(round(eroded_area['spread_pressure_side'], 2)) + "m and SS" + str(round(eroded_area['spread_suction_side'], 2)) + "m"
                 
+                # breakpoint()
                 eroded_areas.append(ErosionAreaDetails(
                     severity=eroded_area['max_severity'],
-                    depth=eroded_area['deepest_part'],
+                    depth=eroded_area['deepest_part'].replace('LE ',''),
                     length=round(eroded_area['eroded_length'], 2),
                     radius_start=round(eroded_area['radius_start'], 2),
                     radius_end=round(eroded_area['radius_end'], 2),
                     spreading=spreading
                 ))
+                eroded_ares_cpt += 1
             
             blade_details[blade_erosion_data['blade']] = BladeErosionDetails(
                 total_length=round(blade_erosion_data['total_eroded_length'], 2),
@@ -1256,7 +1276,6 @@ turbine_ids: list[int] | None = None
                 eroded_areas=eroded_areas
             )
         
-        print("DEBUG", blade_details)
         turbine_details.append(TurbineErosionDetails(
             turbine=concerned_turbines[turbine_erosion_data['turbine_id']],
             a_details=blade_details['A'] if 'A' in blade_details else 'No erosion',
@@ -1264,7 +1283,15 @@ turbine_ids: list[int] | None = None
             c_details=blade_details['C'] if 'C' in blade_details else 'No erosion'
         ))
         
-    resp = str(turbine_details); print(resp)
+    if eroded_ares_cpt > 100:
+        resp = "There is too much data to analyse.\n"
+        if turbine_ids == None:
+            resp += "Try to call this tool with a subgroup of turbines.\n"
+        elif len(turbine_ids) > 1:
+            resp += "Try to call this tool turbine by turbine.\n"
+        print("--- RES", resp); return resp
+        
+    resp = TypeAdapter(list[TurbineErosionDetails]).dump_json(turbine_details).decode(); print("--- RES", resp)
     return resp
     
 @tool
@@ -1274,25 +1301,20 @@ def get_inspection_crack_details(site_id: int,
     """Give crack details for a site at a given inspection.
  
     Use this when the user asks for details or a diagnostic on the cracks of a
-    site: where they are, how long, how deep, how severe. This describes ONE
-    campaign — for how cracks changed since the previous one, use
-    analyse_crack_evolution instead.
+    site: where they are, how long, how severe,what orientation, what shape, what morpho, etc. 
+    
+    This describes ONE campaign — for how cracks changed since the previous one, 
+    use analyse_crack_evolution instead.
  
     Args:
         site_id: Site for which we want the crack details.
         inspection_id: Inspection for which we want the crack details.
-        turbine_ids: Optional. Restricts the answer to these turbines.
+        turbine_ids: Restricts the answer to these turbines.
  
     Returns:
-        One entry per turbine that has at least one crack, with its blades and,
-        for each crack: its face, its position along the blade in meters, its
-        length, how deep it goes (Coat, Laminate, Bonding line, Tip end), its
-        severity and its WIND index.
-        A turbine or a blade with no crack does not appear at all — an absent
-        turbine is a healthy one, not missing data.
-        Cracks are grouped: several overlapping vertical cracks are reported as
-        one, so damage_id identifies the group and is not stable across campaigns.
+        A list of TurbineCrackDetails, one per turbine, with crack details by blade.
     """
+    
     print("TOOL_CALL get_inspection_crack_details", site_id, inspection_id, turbine_ids)
  
     # ------------------------------------------------------------------ #
@@ -1311,7 +1333,7 @@ def get_inspection_crack_details(site_id: int,
         "  ON _societes_sites.site_id = sites.id "
         "LEFT OUTER JOIN fir_records "
         "  ON fir_records.planification_id = asset_scope.planification_id "
-        " AND fir_records.turbine_id = asset_scope.turbine_id "
+        "  AND fir_records.turbine_id = asset_scope.turbine_id "
         "WHERE planifications.deleted_at IS NULL AND asset_scope.deleted_at IS NULL "
         "  AND planifications.id = %s AND sites.id = %s "
         "  AND (fir_records.id IS NULL OR fir_records.deleted_at IS NOT NULL)",
@@ -1341,7 +1363,7 @@ def get_inspection_crack_details(site_id: int,
     # 3. Mise en forme
     # ------------------------------------------------------------------ #
     turbine_details = []
- 
+    cracks_detailed_cpt = 0
     for turbine in turbines_with_cracks:
         blade_details = []
         turbine_cracks_count = 0
@@ -1356,13 +1378,15 @@ def get_inspection_crack_details(site_id: int,
                     measured_as=crack["measured_as"],
                     orientation=crack["orientation"],
                     shape=crack["shape"],
+                    morpho=crack["morpho"],
+                    stripes=crack["stripes"],
                     severity=crack["severity"],
-                    depth=crack["damaged_part"],
                     wind=crack["wind"],
                     measure_source=crack["measure_source"],
                 )
                 for crack in blade["cracks"]
             ]
+            cracks_detailed_cpt += len(blade["cracks"])
  
             severities = [c.severity for c in cracks if c.severity is not None]
  
@@ -1382,5 +1406,361 @@ def get_inspection_crack_details(site_id: int,
  
     # Les turbines les plus fissurées en tête : c'est presque toujours la question.
     turbine_details.sort(key=lambda t: t.cracks_count, reverse=True)
+    
+    if cracks_detailed_cpt > 100:
+        resp = "There is too much data to analyse.\n"
+        if turbine_ids == None:
+            resp += "Try to call this tool with a subgroup of turbines.\n"
+        elif len(turbine_ids) > 1:
+            resp += "Try to call this tool turbine by turbine.\n"
+        print("--- RES", resp); return resp
+    
+    resp = TypeAdapter(list[TurbineCrackDetails]).dump_json(turbine_details).decode(); print("--- RES", resp)
+    return resp
+
+
+
+# =========================================================================== #
+# BLOC 2 — mise en forme
+# =========================================================================== #
+def count_cracks(cracks):
+    """Comptage par statut. cracks est une liste de CrackEvolutionDetails."""
+    return CrackCounts(
+        total=len(cracks),
+        grown=sum(1 for c in cracks if c.status == "grown"),
+        new=sum(1 for c in cracks if c.status == "new"),
+        repaired=sum(1 for c in cracks if c.status == "repaired"),
+        stable=sum(1 for c in cracks if c.status == "stable"),
+    )
  
-    return json.dumps([t.model_dump() for t in turbine_details], default=str)
+def sum_counts(counts_list):
+    """Addition de plusieurs CrackCounts. Des comptages, ça s'additionne."""
+    return CrackCounts(
+        total=sum(c.total for c in counts_list),
+        grown=sum(c.grown for c in counts_list),
+        new=sum(c.new for c in counts_list),
+        repaired=sum(c.repaired for c in counts_list),
+        stable=sum(c.stable for c in counts_list),
+    )
+ 
+def build_crack_model(crack):
+    """Une fissure brute -> CrackEvolutionDetails."""
+    growth = crack["size_delta"]
+    return CrackEvolutionDetails(
+        damage_id=crack["damage_id"],
+        face=crack["face"],
+        status=crack["status"],
+        radius=round(crack["radius"], 2) if crack["radius"] is not None else None,
+        length=round(crack["size"], 3) if crack["size"] is not None else None,
+        previous_length=round(crack["previous_size"], 3)
+            if crack["previous_size"] is not None else None,
+        length_growth=round(growth, 3) if growth is not None else None,
+        measured_as=crack["measured_as"],
+        severity=crack["severity"],
+        previous_severity=crack["previous_severity"],
+        orientation=crack["orientation"],
+        shape=crack["shape"],
+        morpho=crack.get("morpho",None),
+        stripes=crack.get("stripes",None),
+        wind=crack["wind"],
+        growth_was_predicted=crack["growth_was_predicted"],
+    )
+ 
+ 
+def build_turbine_crack_evolution(turbine, turbines_by_id):
+    """Sortie brute d'une turbine -> TurbineCrackEvolution."""
+    # Les fissures arrivent à plat : on les regroupe par pale.
+    cracks_by_blade = {}
+    for crack in turbine["cracks"]:
+        cracks_by_blade.setdefault(crack["blade"], []).append(crack)
+ 
+    blade_models = []
+ 
+    for blade_name in BLADES:
+        blade_cracks = cracks_by_blade.get(blade_name, [])
+        if not blade_cracks:
+            continue
+ 
+        crack_models = [build_crack_model(crack) for crack in blade_cracks]
+ 
+        severities = [c.severity for c in crack_models if c.severity is not None]
+        # Seules les longueurs comptent ici, pas les surfaces : les deux ne se
+        # comparent pas.
+        lengths = [c.length for c in crack_models
+                   if c.length is not None and c.measured_as == "length"]
+ 
+        blade_models.append(BladeCrackEvolution(
+            blade_name=blade_name,
+            counts=count_cracks(crack_models),
+            max_severity=max(severities) if severities else None,
+            longest_crack=max(lengths) if lengths else None,
+            cracks=crack_models,
+        ))
+ 
+    turbine_severities = [b.max_severity for b in blade_models if b.max_severity is not None]
+    turbine_lengths = [b.longest_crack for b in blade_models if b.longest_crack is not None]
+ 
+    return TurbineCrackEvolution(
+        turbine=turbines_by_id[turbine["turbine_id"]],
+        inspection=Inspection(id=turbine["inspection_id"],published_date=get_publish_date(turbine["inspection_id"])),
+        previous_inspection=Inspection(id=turbine["previous_inspection_id"], published_date=get_publish_date(turbine["previous_inspection_id"])),
+        counts=sum_counts([b.counts for b in blade_models]),
+        max_severity=max(turbine_severities) if turbine_severities else None,
+        longest_crack=max(turbine_lengths) if turbine_lengths else None,
+        blades=blade_models,
+    )
+ 
+ 
+# =========================================================================== #
+# BLOC 3 — le tool
+# =========================================================================== #
+@tool
+def analyse_crack_evolution(inspection_id: int,
+                            turbine_id: int | None = None,
+                            site_id: int | None = None,
+                            previous_inspection_id: int | None = None,
+                            blade: str | None = None,
+                            only_changed: bool = False) -> str:
+    '''How the cracks evolved between two inspection campaigns.
+ 
+    Use it when the user asks whether a crack grew, what changed since the last
+    inspection, or which cracks were repaired.
+ 
+    Answer the evolution only. Do not rank turbines for repair or mention repair
+    methods, costs or planning unless the user asked.
+ 
+    A crack never shrinks. A smaller measurement than last campaign is a
+    measurement difference, not a physical change: those cracks are left out.
+ 
+    Cracks are counted, not added up. Two 30cm cracks are not one 60cm crack, so
+    there is no total or average length anywhere: describe a blade, a turbine or
+    a site by how many cracks grew, appeared or were repaired, and by its longest
+    crack.
+ 
+    Args:
+        inspection_id: The campaign to look at.
+        turbine_id: One turbine. 
+        site_id: Whole site, every turbine in one call.
+        previous_inspection_id: Optional. Defaults to the campaign right before
+            each turbine's own, which is what you want.
+        blade: Optional. One blade only: "A", "B" or "C".
+        only_changed: Set True to keep only what is new, grown or repaired.
+ 
+    Returns:
+        Counts for the whole site, then one entry per turbine (most cracks first)
+        with its campaigns, its own counts, its highest severity and its longest
+        crack, then the same per blade, then the cracks themselves: face, radius,
+        length now and before, meters gained, severity, depth, WIND index.
+        Lengths are in meters, except multibranched and stripes cracks, measured
+        as an area in square meters and not compared.
+        Turbines with no crack do not appear. turbines_never_inspected and
+        turbines_without_previous list what was left out, with names.
+    '''
+    print("TOOL_CALL analyse_crack_evolution", inspection_id, turbine_id, site_id,
+          previous_inspection_id, blade, only_changed)
+ 
+    if not turbine_id and not site_id:
+        return "ERROR: give either turbine_id or site_id"
+    if turbine_id and site_id:
+        return "ERROR: give turbine_id or site_id, not both"
+ 
+    # ------------------------------------------------------------------ #
+    # 1. Turbines concernées, et campagne courante de chacune
+    # ------------------------------------------------------------------ #
+    if turbine_id:
+        turbine_ids = [turbine_id]
+        current_by_turbine = {turbine_id: inspection_id}
+        never_inspected = []
+    else:
+        turbine_ids = resolve_site_turbine_ids(site_id)
+        if not turbine_ids:
+            return "ERROR: no turbine found for this site"
+ 
+        current_by_turbine = resolve_current_by_turbine(turbine_ids, inspection_id)
+        never_inspected = [tid for tid in turbine_ids if tid not in current_by_turbine]
+        turbine_ids = [tid for tid in turbine_ids if tid in current_by_turbine]
+ 
+        if not turbine_ids:
+            return "ERROR: none of the turbines of this site was inspected at that date"
+ 
+    # ------------------------------------------------------------------ #
+    # 2. Campagne précédente de chacune
+    # ------------------------------------------------------------------ #
+    if previous_inspection_id is not None:
+        # Imposée par l'utilisateur : aucune turbine ne peut manquer.
+        previous_by_turbine = {tid: previous_inspection_id for tid in turbine_ids}
+        without_previous = []
+    else:
+        previous_by_turbine = resolve_previous_by_turbine(current_by_turbine)
+        without_previous = [tid for tid in turbine_ids if tid not in previous_by_turbine]
+        turbine_ids = [tid for tid in turbine_ids if tid in previous_by_turbine]
+ 
+        if not turbine_ids:
+            return ("ERROR: no earlier inspection campaign with damages for these "
+                    "turbines, there is nothing to compare with")
+ 
+    # ------------------------------------------------------------------ #
+    # 3. Chargement groupé, puis comparaison
+    # ------------------------------------------------------------------ #
+    current_data = load_crack_data_by_planification(turbine_ids, current_by_turbine)
+    previous_data = load_crack_data_by_planification(turbine_ids, previous_by_turbine)
+ 
+    turbines_payload = compare_turbines_cracks(
+        turbine_ids, current_by_turbine, previous_by_turbine,
+        current_data, previous_data, blade,
+    )
+ 
+    if only_changed:    
+        for turbine in turbines_payload:
+            turbine["cracks"] = [c for c in turbine["cracks"] if c["status"] != "stable"]
+        # Une turbine dont toutes les fissures sont stables n'a plus rien à dire.
+        turbines_payload = [t for t in turbines_payload if t["cracks"]]
+ 
+    # ------------------------------------------------------------------ #
+    # 4. Mise en forme
+    # ------------------------------------------------------------------ #
+    turbine_names = resolve_turbine_names(
+        turbine_ids + never_inspected + without_previous)
+ 
+    def as_turbine(tid):
+        return Turbine(id=tid, name=turbine_names.get(tid) or str(tid))
+ 
+    turbines_by_id = {tid: as_turbine(tid) for tid in turbine_ids}
+ 
+    turbine_models = [build_turbine_crack_evolution(turbine, turbines_by_id)
+                      for turbine in turbines_payload]
+ 
+    # Les turbines les plus fissurées en tête.
+    turbine_models.sort(key=lambda t: t.counts.total, reverse=True)
+ 
+    result = SiteCrackEvolution(
+        site=Site(id=site_id, name=get_site_name(site_id)) if site_id
+             else Site(id=0, name="single turbine"),
+        counts=sum_counts([t.counts for t in turbine_models]),
+        turbines_with_cracks=len(turbine_models),
+        turbines=turbine_models,
+        turbines_never_inspected=[as_turbine(tid) for tid in never_inspected],
+        turbines_without_previous=[as_turbine(tid) for tid in without_previous],
+    )
+    print("--- RES", result)
+    ###TODO#### 
+    #FILTRE SEVERITE
+    
+    if result.counts.total > 30 and site_id:
+        return "There are too many cracks on this site ask the user for a specific turbine"
+    elif result.counts.total > 30 and turbine_id:
+        return "There are too many cracks on this turbine ask the user if he wants to filters only with changed cracks"
+
+    resp = TypeAdapter(SiteCrackEvolution).dump_json(result).decode(); print("--- RES", resp)
+    return resp
+
+# @tool
+# def analyse_crack_evolution(turbine_id: int,
+# inspection_id: int,
+# previous_inspection_id: int | None = None,
+# blade: str | None = None,
+# only_changed: bool = False) -> str:
+#     '''Tell how the cracks of a turbine evolved between two inspection campaigns.
+ 
+#     Use this when the user asks whether a crack grew, whether damages got worse
+#     on a turbine, what changed since the last inspection, or which cracks were
+#     repaired.
+ 
+#     Args:
+#         turbine_id: Identifier of the turbine to analyse.
+#         inspection_id: The campaign to look at.
+#         previous_inspection_id: Optional. The campaign to compare against.
+#             When omitted, the campaign right before inspection_id is used.
+#         blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
+#         only_changed: Set True to drop unchanged cracks
+#             and keep only what is new, grown or repaired.
+ 
+#     Returns:
+#         The two campaigns compared, and one entry per crack with its blade, face,
+#         radius, shape, severity and WIND index, its current and previous size in
+#         meters, and a status: new (absent before), grown, stable, or repaired
+#         (present before, gone now).
+
+#         Sizes are lengths in meters, except for multibranched and stripes cracks
+#         which are areas in square meters and are not compared. Each entry also
+#         states whether its size comes from a manual measurement or from the image:
+#         a delta between two different sources is not reliable. growth_was_predicted
+#         marks a crack whose WIND index had already forecast the growth.
+#     '''
+#     print("TOOL_CALL analyse_crack_evolution", turbine_id, inspection_id,
+#           previous_inspection_id, blade, only_changed)
+ 
+#     if previous_inspection_id is None:
+#         previous_inspection_id = resolve_previous_planification(turbine_id, inspection_id)
+#         if previous_inspection_id is None:
+#             res = "ERROR: no earlier inspection campaign with damages for this turbine, there is nothing to compare with"
+#             print(res)
+#             return res
+ 
+#     full_data = fetch_crack_data(inspection_id, turbine_id)
+#     previous_full_data = fetch_crack_data(previous_inspection_id, turbine_id)
+ 
+#     evolutions = []
+ 
+#     for current_blade in ([blade] if blade else BLADES):
+#         blade_data = select_blade(full_data, current_blade)
+#         previous_blade_data = select_blade(previous_full_data, current_blade)
+ 
+#         if blade_data.empty and previous_blade_data.empty:
+#             continue
+ 
+#         #TODO vérifier si les cracks qui ont "rétrécis" sont remontés ou pas, c'est pas clair
+#         evolutions.extend(compare_blade_cracks(
+#             build_cracks_by_face(blade_data),
+#             build_cracks_by_face(previous_blade_data),
+#             current_blade,
+#         ))
+ 
+#     if only_changed:
+#         evolutions = [e for e in evolutions if e.status != "stable"]
+ 
+#     #TODO mettre toutes les infos dans des objets
+#     res = json.dumps({
+#         "turbine_id": turbine_id,
+#         "inspection_id": inspection_id,
+#         "previous_inspection_id": previous_inspection_id,
+#         "cracks": [asdict(e) for e in evolutions],
+#     }, default=str)
+ 
+#     print("-- RES", res)
+#     return res
+
+@tool
+def get_recent_severity_5_damage(look_back_days: int = 30, country_id: int | None = None) -> str:
+    """List recent severity 5 or priority 1 damage, and on which inspection and site they have been reported.
+    
+    Use this if the client want to know about a recent severity 5 or priority 1 damage.
+    
+    Args:
+        look_back_days: Size of the look-back window, in days (default 30). 
+        Must correspond precisely to the number of day needed to cover the recent period whose we want informations.
+        country_id: Restrict to the inspections on a specific country
+    Returns:
+        A list of Damage, all severity 5 or priority 1, with their informations.
+    """
+    print("TOOL_CALL get_recent_severity_5_damage", look_back_days, country_id)
+    
+    severity_5_raw_data = get_recent_severity_5(look_back_days, country_id)
+    
+    result = []
+    
+    for record in severity_5_raw_data:
+        result.append(Damage(
+            id=record['damage_id'],
+            damage_type=DamageType(id=record['damage_type_id'], name=record['damage_type']),
+            inspection=Inspection(
+                id=record['planif_id'], date=record['planif_date'], 
+                published_date=get_publish_date(record['planif_id'])
+            ),
+            site=Site(id=record['site_id'], name=record['site_name'])
+        ))
+    
+    resp = TypeAdapter(list[Damage]).dump_json(result).decode(); print("--- RES", resp)
+    return resp
+    
+    

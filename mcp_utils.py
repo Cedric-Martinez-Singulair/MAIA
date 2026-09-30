@@ -5,9 +5,12 @@ from turbine_mcp import *
 
 MAIA_TOOLS = [
     get_inspection_type_ids,
+    get_blade_component_ids,
     get_damage_type_ids,
-    get_country_ids_by_name,
+    get_country_ids_by_name,    
     get_turbine_model_ids_by_name,
+    get_client_company_ids,
+    get_turbines,
     get_sites,
     get_site_damage_ids,
     
@@ -23,14 +26,22 @@ MAIA_TOOLS = [
     analyse_erosion_evolution,
     get_inspection_erosion_details,
     get_inspection_crack_details,
+    get_recent_severity_5_damage,
     
     count_turbines,
+    get_turbines_location,
+    get_sites_location,
+    turbine_damage_height,
     
-    get_wind_index_explanation,
+    update_persona,
+    # get_wind_index_explanation,
+    get_campaign_damage_infos,
     filter_report,
-    singulair_what_s_up,
+    what_s_up,
+    # singulair_what_s_up,
     get_site_inspections,
     get_month_inspections,
     get_recent_inspections,
-    prioritize_campaign_repair
+    prioritize_campaign_repair,
+    manufacturer_damage_stats
 ]

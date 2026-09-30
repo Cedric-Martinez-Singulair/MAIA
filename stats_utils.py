@@ -70,7 +70,20 @@ WIND_GROWTH_PREDICTED = ["M2", "M3", "S2", "S3"]
 # =========================================================================== #
 # Constantes fissures
 # =========================================================================== #
-CRACK_DEFECT_TYPE = "Crack"
+CRACK_DEFECT_TYPE = (
+    "Crack",
+    "Crack, diagonal",
+    "Crack, longitudinal",
+    "Crack, transversal",
+    "Crack Transverse",
+    "Crack Transverse + Longitudinal",
+    "Crack Longitudinal",
+    "White Crack Longitudinal",
+    "White Crack Longitudinal + Transverse",
+    "White Crack Transverse",
+    "White Crack 45°",
+    "Paint Crack"
+)
 
 # Croissance significative : (taille précédente en mm) -> % minimum.
 # Valeurs statistiques reprises de make_crack_size_sentence.
@@ -93,13 +106,14 @@ CRACK_MATCH_MAX_GAP = 0.5
 # Fenêtre d'isolement : le repli par proximité n'est tenté que si la zone ne
 # contient aucune autre fissure précédente à cette distance. Sinon, rien ne dit
 # laquelle des deux est la bonne.
-CRACK_MATCH_ISOLATION_RADIUS = 5.0
+CRACK_MATCH_ISOLATION_RADIUS = 2.0
 
 
 # =========================================================================== #
 # Constantes érosion
 # =========================================================================== #
-LEE_DEFECT_TYPE = "Leading Edge Erosion"
+LEE_DEFECT_TYPE = ("Leading Edge Erosion","Paint Erosion","Laminate Erosion","Erosion Protection Film Air Entrapment","Laminate Destroyed",)
+
 
 # Variation minimale pour être significative, en %.
 LEE_GROWTH_THRESHOLD_PCT = 5.0
@@ -164,8 +178,12 @@ CRACK_QUERY = """
           * conv_pixelh_m) / 1000))) / 2.0 AS radius_float,
         components.label_en AS part_damaged,
         CASE WHEN criticality_id = 6 THEN 0 ELSE criticality_id END AS criticality,
-        damage_axes.name AS crack_axis,
-        damage_shapes.name AS crack_shape,
+
+        damage_axes.name         AS crack_axis,
+        damage_shapes.name       AS crack_shape,
+        damage_morphologies.name AS crack_morpho,
+        damage_stripes.name      AS crack_stripes,
+
         wind, wind_severity, wind_desc, wind_new_desc, wind_new_sev,
         xy_coordinates, conv_pixelh_m, conv_pixelw_m,
         models.name AS model,
@@ -187,20 +205,53 @@ CRACK_QUERY = """
     JOIN analysis ON analysis.id = _incidents.analysi_id
     JOIN parts ON parts.id = _incidents.part_id
     LEFT JOIN crack_infos ON crack_infos.damage_id = _incidents.id
-    LEFT JOIN damage_axes ON damage_axes.id = damage_axis_id
-    LEFT JOIN damage_shapes ON damage_shapes.id = damage_shape_id
+    LEFT JOIN damage_axes
+        ON damage_axes.id = COALESCE(crack_infos.verified_damage_axis_id, crack_infos.damage_axis_id)
+    LEFT JOIN damage_shapes
+        ON damage_shapes.id = COALESCE(crack_infos.verified_damage_shape_id, crack_infos.damage_shape_id)
+    LEFT JOIN damage_morphologies
+        ON damage_morphologies.id = COALESCE(crack_infos.verified_damage_morpho_id, crack_infos.damage_morpho_id)
+    LEFT JOIN damage_stripes
+        ON damage_stripes.id = COALESCE(crack_infos.verified_damage_stripe_id, crack_infos.damage_stripe_id)
     JOIN components_turbines ON components_turbines.id = _incidents.component_turbine_id
     JOIN turbines ON turbines.id = _incidents.turbine_id
     JOIN models ON models.id = turbines.model_name
     WHERE conv_pixelh_m IS NOT NULL AND conv_pixelw_m IS NOT NULL
-      AND defect_types.label_en = %s
+      AND defect_types.label_en IN %s
       AND components.label_en != 'Drain hole'
 """
+# EROSION_QUERY = """
+#     SELECT
+#         _incidents.turbine_id AS turbine_id,
+#         components_turbines.name AS blade,
+#         parts.label_en AS side,
+#         FLOOR(radius) AS radius,
+#         components.label_en AS part_damaged,
+#         CASE WHEN criticality_id = 6 THEN 0 ELSE criticality_id END AS criticality,
+#         wind, wind_severity, wind_desc, wind_new_desc, wind_new_sev,
+#         xy_coordinates, conv_pixelh_m, conv_pixelw_m,
+#         models.name AS model,
+#         models.blade_length AS blade_length,
+#         turbines.tower_height AS tower_height,
+#         turbines.altitude, turbines.distance_to_sea,
+#         turbines.latitude, turbines.longitude,
+#         turbines.soil_texture_id, turbines.temperatures,
+#         turbines.wind_speed
+#     FROM (
+#         SELECT * FROM incident_records
+#         WHERE dismissed = FALSE AND decision_id != 0 AND deleted_at IS NULL
+#         AND planification_id = %s AND turbine_id = %s
+#     ) _incidents
+#     JOIN components ON components.id = _incidents.component_id
+#     JOIN defect_types ON defect_types.id = _incidents.defect_type_id
+#     JOIN analysis ON analysis.id = _incidents.analysi_id
+#     JOIN parts ON parts.id = _incidents.part_id
+#     JOIN components_turbines ON components_turbines.id = _incidents.component_turbine_id
+#     JOIN turbines ON turbines.id = _incidents.turbine_id
+#     JOIN models ON models.id = turbines.model_name
+#     WHERE conv_pixelh_m IS NOT NULL AND conv_pixelw_m IS NOT NULL
+# """
 
-# L'érosion n'a pas besoin des colonnes de position spatiale : elle s'apparie
-# par plage de rayons, pas par bounding box.
-# turbine_id est sélectionné : select_turbine en a besoin pour découper le
-# DataFrame quand on charge plusieurs turbines d'un coup.
 EROSION_QUERY = """
     SELECT
         _incidents.turbine_id AS turbine_id,
@@ -218,11 +269,17 @@ EROSION_QUERY = """
         turbines.latitude, turbines.longitude,
         turbines.soil_texture_id, turbines.temperatures,
         turbines.wind_speed
-    FROM (
-        SELECT * FROM incident_records
-        WHERE dismissed = FALSE AND decision_id != 0 AND deleted_at IS NULL
-        AND planification_id = %s AND turbine_id = %s
-    ) _incidents
+FROM (
+    SELECT *
+    FROM incident_records
+    WHERE dismissed = FALSE
+      AND deleted_at IS NULL
+    AND planification_id = %s AND turbine_id = %s
+      AND (
+            (defect_type_id = 41)
+         OR (component_id IN (70, 71,84) AND defect_type_id IN (113, 123, 124))
+      )
+) AS _incidents
     JOIN components ON components.id = _incidents.component_id
     JOIN defect_types ON defect_types.id = _incidents.defect_type_id
     JOIN analysis ON analysis.id = _incidents.analysi_id
@@ -231,8 +288,8 @@ EROSION_QUERY = """
     JOIN turbines ON turbines.id = _incidents.turbine_id
     JOIN models ON models.id = turbines.model_name
     WHERE conv_pixelh_m IS NOT NULL AND conv_pixelw_m IS NOT NULL
-      AND defect_types.label_en = %s
 """
+
 
 # Même requête, mais sur un lot de turbines : une seule requête au lieu de N.
 EROSION_QUERY_BULK = EROSION_QUERY.replace(
@@ -257,15 +314,13 @@ def fetch_crack_data(planification_id, turbine_id):
     return cursor_to_dataframe(TW_DB_CURSOR)
 
 
-
 def fetch_erosion_data_bulk(planification_id, turbine_ids):
     """Dommages d'érosion de plusieurs turbines, en une seule requête."""
     if not turbine_ids:
         return pd.DataFrame()
-
     TW_DB_CURSOR.execute(
         EROSION_QUERY_BULK,
-        (planification_id, list(turbine_ids), LEE_DEFECT_TYPE),
+        (planification_id, list(turbine_ids)),
     )
     return cursor_to_dataframe(TW_DB_CURSOR)
 
@@ -468,7 +523,7 @@ def group_cracks_by_face(crack_raw_data):
     """
     if crack_raw_data is None or crack_raw_data.empty:
         return None
-
+    
     ids = list(crack_raw_data["damage_id"])
     radius = list(crack_raw_data["radius"])
     heights = list(crack_raw_data["height"])
@@ -479,18 +534,20 @@ def group_cracks_by_face(crack_raw_data):
     faces = list(crack_raw_data["side"])
     axis = list(crack_raw_data["crack_axis"])
     shapes = list(crack_raw_data["crack_shape"])
+    morpho = list(crack_raw_data["crack_morpho"])
+    stripes = list(crack_raw_data["crack_stripes"])
     bboxes = list(crack_raw_data["bbox_espace"])
 
     sort_data_by_face_and_radius(
-        faces, radius, [ids, heights, widths, winds, parts, sevs, axis, shapes, bboxes])
+        faces, radius, [ids, heights, widths, winds, parts, sevs, axis,morpho, shapes,stripes, bboxes])
 
     cracks = []
     section = None
     last_radius_end = -1.0
 
     for (dmg_id, dmg_radius, dmg_height, dmg_width, dmg_wind, dmg_part,
-         dmg_sev, dmg_face, dmg_axis, dmg_shape, dmg_bbox) in zip(
-            ids, radius, heights, widths, winds, parts, sevs, faces, axis, shapes, bboxes):
+         dmg_sev, dmg_face, dmg_axis, dmg_shape, dmg_bbox,dmg_morpho,dmg_stripes) in zip(
+            ids, radius, heights, widths, winds, parts, sevs, faces, axis, shapes, bboxes,morpho,stripes):
 
         if dmg_wind is None:
             dmg_wind = "Error"
@@ -508,7 +565,7 @@ def group_cracks_by_face(crack_raw_data):
                 "height": dmg_height, "width": dmg_width,
                 "orientation": dmg_axis, "wind": dmg_wind, "part": dmg_part,
                 "sev": dmg_sev, "face": dmg_face, "shape": dmg_shape,
-                "bbox_espace": dmg_bbox,
+                "bbox_espace": dmg_bbox,"morpho" : dmg_morpho, "stripes":dmg_stripes,
             })
             continue
 
@@ -541,7 +598,7 @@ def group_cracks_by_face(crack_raw_data):
                 "height": dmg_height, "width": dmg_width,
                 "orientation": "vertical", "wind": dmg_wind, "part": dmg_part,
                 "sev": dmg_sev, "face": dmg_face, "shape": dmg_shape,
-                "bbox_espace": dmg_bbox,
+                "bbox_espace": dmg_bbox,"morpho" : dmg_morpho,"stripes":dmg_stripes,
             }
 
         last_radius_end = dmg_radius_end
@@ -577,7 +634,7 @@ def enrich_cracks_with_measures(cracks_by_face):
             )
             measures = {row["id"]: row["measure"] for row in cursor.fetchall()}
     finally:
-        connection.close()
+        pass
 
     for crack in all_cracks:
         raw = measures.get(crack["id"])
@@ -829,6 +886,7 @@ def build_lee_sections(lee_raw_data):
 
     sort_data_by_face_and_radius(faces, radius, [heights, winds, parts, sevs])
 
+    
     total_lee = 0.0
     total_laminate = 0.0
     sections = []
@@ -849,7 +907,10 @@ def build_lee_sections(lee_raw_data):
 
         same_section = (section is not None
                         and dmg_face == section["face"]
-                        and dmg_radius_start <= last_radius_end)
+                        and dmg_radius_start <= last_radius_end
+                        #TODO CORRIGER LE BUG DE TAILLE SI ON FAIT CA RAJOUTTER COAT LENGTH 
+                        # and dmg_part == section["deepest_part"]
+                        )
 
         # Seule la portion non déjà couverte compte : sans ça, deux dommages qui
         # se chevauchent gonfleraient artificiellement la longueur érodée.
@@ -860,7 +921,9 @@ def build_lee_sections(lee_raw_data):
 
         if dmg_face == "Leading Edge":
             total_lee += added
-        if dmg_part == "Laminate":
+        if (dmg_part == "Laminate" or dmg_part == "Laminate Erosion" or dmg_part =="Laminate Destroyed"or dmg_part =="Laminate Exposed")and dmg_face == "Leading Edge":
+            # if lee_raw_data["turbine_id"].unique()[0] == 230071:
+            #     breakpoint()
             total_laminate += added
 
         if same_section:
@@ -890,7 +953,7 @@ def build_lee_sections(lee_raw_data):
         by_face[item["face"]].append(item)
 
     compute_lateral_spread(by_face)
-
+    
     return (by_face["Leading Edge"], total_lee, total_laminate,
             len(by_face["Pressure side"]), len(by_face["Suction side"]))
 
@@ -1023,7 +1086,7 @@ class BladeErosion:
     spreads_to_suction_side: bool = False
 
     eroded_areas: list = field(default_factory=list)
-    
+
 @dataclass
 class ErodedArea:
     """Une zone érodée du bord d'attaque, comparée à la campagne précédente."""
@@ -1160,10 +1223,9 @@ def compute_eroded_areas(sections, blade):
 def compute_blade_erosion(current, blade, include_areas=True):
     """Compare le bilan d'érosion d'une pale entre deux campagnes."""
     sections, total, laminate, nb_ps, nb_ss = current
-
     if total == 0:
         return None
-
+    
     evolution = BladeErosion(
         blade=blade,
         total_eroded_length=total,
@@ -1277,14 +1339,12 @@ def get_current_data_for_turbines(turbine_ids, current_by_turbine,
     return payload
 
 
-
-# pour tout le site au lieu d'une par turbine.
 CRACK_QUERY_BULK = CRACK_QUERY.replace(
     "AND planification_id = %s AND turbine_id = %s",
     "AND planification_id = %s AND turbine_id = ANY(%s)",
 )
- 
- 
+
+
 def fetch_crack_data_bulk(planification_id, turbine_ids):
     """Fissures de plusieurs turbines, en une seule requête."""
     if not turbine_ids:
@@ -1295,8 +1355,8 @@ def fetch_crack_data_bulk(planification_id, turbine_ids):
         (planification_id, list(turbine_ids), CRACK_DEFECT_TYPE),
     )
     return cursor_to_dataframe(TW_DB_CURSOR)
- 
- 
+
+
 def describe_blade_cracks(blade_data, blade_name):
     """Fissures d'une pale, sans comparaison.
  
@@ -1311,7 +1371,6 @@ def describe_blade_cracks(blade_data, blade_name):
     for face_name in FACES:
         for crack in cracks_by_face.get(face_name, []):
             size, unit = get_crack_measurement(crack)
- 
             described_cracks.append({
                 "damage_id": crack["id"],
                 "blade": blade_name,
@@ -1319,6 +1378,8 @@ def describe_blade_cracks(blade_data, blade_name):
                 "radius": crack.get("radius"),
                 "orientation": crack.get("orientation"),
                 "shape": crack.get("shape"),
+                "morpho":crack.get("morpho"),
+                "stripes":crack.get("stripes"),
                 "severity": crack.get("sev"),
                 # Coat / Laminate / Bonding line / Tip end : la profondeur
                 "damaged_part": crack.get("part"),
@@ -1330,8 +1391,8 @@ def describe_blade_cracks(blade_data, blade_name):
             })
  
     return described_cracks
- 
- 
+
+
 def get_cracks_for_turbines(turbine_ids, crack_data):
     """Fissures de plusieurs turbines, à partir d'un DataFrame déjà chargé.
  
@@ -1357,4 +1418,74 @@ def get_cracks_for_turbines(turbine_ids, crack_data):
             })
  
     return turbines_with_cracks
+
+
+def compare_one_turbine_cracks(turbine_id, current_data, previous_data, blade):
+    """Compare les fissures des pales d'une turbine, données déjà chargées.
  
+    Pendant de compare_one_turbine côté fissures. Renvoie None si la turbine n'a
+    aucune fissure, ni avant ni maintenant.
+    """
+    evolutions = []
+ 
+    for current_blade in ([blade] if blade else BLADES):
+        blade_data = select_blade(current_data, current_blade)
+        previous_blade_data = select_blade(previous_data, current_blade)
+ 
+        if blade_data.empty and previous_blade_data.empty:
+            continue
+ 
+        evolutions.extend(compare_blade_cracks(
+            build_cracks_by_face(blade_data),
+            build_cracks_by_face(previous_blade_data),
+            current_blade,
+        ))
+ 
+    if not evolutions:
+        return None
+    return {"turbine_id": turbine_id, "cracks": [asdict(e) for e in evolutions]}
+
+
+def compare_turbines_cracks(turbine_ids, current_by_turbine, previous_by_turbine,
+                            current_data_by_planification,
+                            previous_data_by_planification, blade):
+    """Comparaison des fissures, turbine par turbine.
+ 
+    Chaque turbine pioche dans SA campagne courante et SA campagne précédente :
+    un site inspecté en plusieurs lots reste couvert intégralement.
+    """
+    payload = []
+ 
+    for turbine_id in turbine_ids:
+        current_id = current_by_turbine[turbine_id]
+        previous_id = previous_by_turbine[turbine_id]
+ 
+        result = compare_one_turbine_cracks(
+            turbine_id,
+            select_turbine(current_data_by_planification[current_id], turbine_id),
+            select_turbine(previous_data_by_planification[previous_id], turbine_id),
+            blade,
+        )
+ 
+        if result is not None:
+            result["inspection_id"] = current_id
+            result["previous_inspection_id"] = previous_id
+            payload.append(result)
+ 
+    return payload
+
+
+def load_crack_data_by_planification(turbine_ids, planification_by_turbine):
+    """{planification_id: DataFrame} — une requête par campagne distincte.
+ 
+    Sur un site classique cela fait une ou deux requêtes, pas une par turbine.
+    """
+    data_by_planification = {}
+ 
+    for planification_id in set(planification_by_turbine[tid] for tid in turbine_ids):
+        concerned = [tid for tid in turbine_ids
+                     if planification_by_turbine[tid] == planification_id]
+        data_by_planification[planification_id] = fetch_crack_data_bulk(
+            planification_id, concerned)
+ 
+    return data_by_planification
