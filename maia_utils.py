@@ -37,6 +37,7 @@ class DamageType(BaseModel):
 class TurbineModel(BaseModel):
     id: int = Field(description='Turbine model id, needed to identify the turbine model in the turbinewatch database')
     name: str = Field(description='Turbine model name (e.g. V90)')
+    manufacturer:str|None = Field(default='Unknown',description='Turbine blade manufacturer ex:EVC')
 
 class Turbine(BaseModel):
     id: int = Field(description='Turbine id, needed to identify the turbine in the turbinewatch database')
@@ -55,6 +56,10 @@ class Site(BaseModel):
     )
     longitude : float | None = Field(default=None, description='The longitude of the site')
     latitude : float | None= Field(default=None, description='The latitude of the site')
+    
+class NearbySite(BaseModel):
+    site: Site = Field(description='A site near the reference one')
+    distance: float = Field(description='Distance from the reference site, in km')
 
 class Country(BaseModel):
     id: int = Field(description='Country id, needed to identify the country in the turbinewatch database')
@@ -205,6 +210,8 @@ class TurbineRepairSummary(BaseModel):
  
 class CherryPickerCoverage(BaseModel):
     working_height: int = Field(description="Cherry picker working height (m)")
+    price_without_driver_eur: float | None = Field(description="Indicative daily price excl. VAT without driver (EUR), None if not offered")
+    price_with_driver_eur: float | None = Field(description="Indicative daily price excl. VAT with driver/operator (EUR), None if unknown")
     reachable_damages: int = Field(description="Number of damages this cherry picker can reach")
     reachable_damages_pct: float = Field(description="Share of all damages it can reach (%)")
     reachable_critical_damages: int = Field(description="Number of reachable damages with severity > 2")

@@ -524,6 +524,210 @@ def get_individual_damage_infos(individual_damage_id: int) -> str:
     resp = TypeAdapter(Damage).dump_json(damage_infos).decode(); print("--- RES ", resp)
     return resp
 
+
+# Hauteur de travail (m) -> prix de location journalier HT (€)
+# Tarifs indicatifs constatés pour 1 jour de location (chauffeur/opérateur inclus pour > 30 m)
+CHERRY_PICKER_PRICES: dict[int, dict[str, float | None]] = {
+    27: {"sans_chauffeur": 900, "avec_chauffeur": 1400},
+    37: {"sans_chauffeur": None, "avec_chauffeur": 2100},
+    40: {"sans_chauffeur": None, "avec_chauffeur": 2400},
+    47: {"sans_chauffeur": None, "avec_chauffeur": 2800},
+    51: {"sans_chauffeur": None, "avec_chauffeur": 3100},
+    54: {"sans_chauffeur": None, "avec_chauffeur": 3400},
+    65: {"sans_chauffeur": None, "avec_chauffeur": 4200},
+    72: {"sans_chauffeur": None, "avec_chauffeur": 4800},
+    75: {"sans_chauffeur": None, "avec_chauffeur": 5200},
+    90: {"sans_chauffeur": None, "avec_chauffeur": 6800},
+    100: {"sans_chauffeur": None, "avec_chauffeur": 8500},
+}
+
+CHERRY_PICKER_HEIGHTS: list[int] = sorted(CHERRY_PICKER_PRICES)
+OPERATOR_INCLUDED_ABOVE_M = 30
+SUSPENDED_PLATFORM = "Suspended platform"
+SAFETY_MARGIN_M = 2.0  # marge entre la hauteur du dégât et la hauteur de travail
+MAX_DAMAGES_DETAIL = 150
+ 
+ 
+def reachable(height: float | None, working_height: float) -> bool:
+    return height is not None and height + SAFETY_MARGIN_M <= working_height
+ 
+ 
+def recommended_height(height: float | None) -> int | None:
+    if height is None:
+        return None
+    return next((h for h in CHERRY_PICKER_HEIGHTS if reachable(height, h)), None)
+ 
+ 
+def recommend_equipment(height: float | None) -> str:
+    if height is None:
+        return "Unknown (missing tower_height or radius)"
+    h = recommended_height(height)
+    return f"Cherry picker {h} m" if h else SUSPENDED_PLATFORM
+
+
+@tool
+def get_repair_damage_height(inspection_id: int,
+                          turbine_ids: list[int] | None = None,
+                          defect_type_ids: list[int] | None = None):
+    """
+    Get the repair height of blade damages, how many of them each cherry picker height can reach,
+    and the indicative daily rental price of each cherry picker (with / without driver).
+    ALWAYS call this tool whenever repair is mentioned in any way (repair, fix, maintenance,
+    intervention, "what should I do about this damage"...), even if the user does not ask
+    for heights or equipment. Use the result to advise the user on how to carry out the repair.
+
+    Args:
+        inspection_id: The inspection (planification) ID. Alone, it covers the whole site.
+        turbine_ids: Turbines to include. None = all turbines of the inspection.
+        defect_type_ids: Damage types to include. A damage name can have several IDs,
+            so include all IDs with the same or similar name. None = all damages.
+
+    Returns:
+        - cherry_picker_coverage: for each standard cherry picker height, its indicative daily
+          prices (with / without driver), the number and share of damages it can reach, and the turbines fully repairable
+        - damages_needing_suspended_platform: damages too high for any cherry picker
+        - turbines: heights (min / avg / max), max severity, smallest equipment and its price,
+          damage detail
+        repair height = tower_height - radius (blade pointing down).
+
+    How to answer:
+        - Focus on coverage vs price: "a X m cherry picker reaches N damages (P%) for ~Y €/day",
+          compare a few relevant heights, and say what is left for a suspended platform.
+        - Prices are indicative market rates excl. VAT for 1 day, with and without driver,
+          only to give an order of magnitude: always say they must be confirmed with a rental quote.
+          Above ~30 m, truck-mounted cherry pickers are only rented with a driver/operator
+          (CACES R486 cat. B, truck licence, insurance), hence no price without driver.
+          Never invent a price, never give one for the suspended platform.
+        - Heights and prices are market references only: never mention a provider or brand,
+          and never say the equipment is available, owned or rented by us.
+        - Severity <= 2 is NEVER critical: never call these damages critical, urgent or
+          dangerous. Present them as minor damages to handle during planned maintenance.
+        - Only damages with severity > 2 can be critical and should be prioritized.
+        - Remind that a cherry picker needs a flat, accessible ground near the tower.
+        - If detail_note is present, tell the user the detail was reduced and offer to
+          narrow down to one or a few turbines (turbine_ids) for the full damage detail.
+    """
+    conditions = [
+        "incident_records.planification_id = %s",
+        "incident_records.deleted_at IS NULL",
+        "incident_records.component_id <> 1",
+    ]
+    req_params: list = [inspection_id]
+    if turbine_ids:
+        conditions.append("turbines.id = ANY(%s)")
+        req_params.append(turbine_ids)
+    if defect_type_ids:
+        conditions.append("incident_records.defect_type_id = ANY(%s)")
+        req_params.append(defect_type_ids)
+ 
+    req_str = f"""
+        SELECT
+            turbines.id AS turbine_id,
+            turbines.tower_height,
+            turbines.tower_height - incident_records.radius AS damage_repair_height,
+            incident_records.id AS incident_id,
+            incident_records.criticality_id AS severity,
+            parts.label_en AS part,
+            components.label_en AS component,
+            defect_types.label_en AS defect_type
+        FROM turbines
+        JOIN incident_records ON incident_records.turbine_id = turbines.id
+        LEFT JOIN defect_types ON defect_types.id = incident_records.defect_type_id
+        LEFT JOIN components ON components.id = incident_records.component_id
+        LEFT JOIN parts ON parts.id = incident_records.part_id
+        WHERE {" AND ".join(conditions)}
+        ORDER BY turbines.id, damage_repair_height DESC
+    """
+    TW_DB_CURSOR.execute(req_str, req_params)
+    cols = [d[0] for d in TW_DB_CURSOR.description]
+    rows = [r if isinstance(r, dict) else dict(zip(cols, r)) for r in TW_DB_CURSOR.fetchall()]
+ 
+    by_turbine: dict[int, dict] = {}
+    for row in rows:
+        t = by_turbine.setdefault(row["turbine_id"], {
+            "tower_height": float(row["tower_height"]) if row["tower_height"] is not None else None,
+            "damages": [],
+        })
+        t["damages"].append(DamageRepairHeight(
+            part=row["part"],
+            component=row["component"],
+            defect_type=row["defect_type"],
+            severity=row["severity"],
+            damage_repair_height=float(row["damage_repair_height"]) if row["damage_repair_height"] is not None else None,
+        ))
+ 
+    turbines: list[TurbineRepairSummary] = []
+    for turbine_id, t in by_turbine.items():
+        heights = [d.damage_repair_height for d in t["damages"] if d.damage_repair_height is not None]
+        severities = [d.severity for d in t["damages"] if d.severity is not None]
+        max_h = max(heights) if heights else None
+        rec_h = recommended_height(max_h)
+        turbines.append(TurbineRepairSummary(
+            turbine_id=turbine_id,
+            tower_height=t["tower_height"],
+            nb_damages=len(t["damages"]),
+            max_severity=max(severities) if severities else None,
+            avg_damage_repair_height=round(sum(heights) / len(heights), 2) if heights else None,
+            min_damage_repair_height=min(heights) if heights else None,
+            max_damage_repair_height=max_h,
+            recommended_equipment=recommend_equipment(max_h),
+            recommended_price_without_driver_eur=CHERRY_PICKER_PRICES[rec_h]["sans_chauffeur"] if rec_h else None,
+            recommended_price_with_driver_eur=CHERRY_PICKER_PRICES[rec_h]["avec_chauffeur"] if rec_h else None,
+            damages=t["damages"],
+        ))
+ 
+    all_damages = [d for t in turbines for d in t.damages]
+    total = len(all_damages)
+    coverage = []
+    for h in CHERRY_PICKER_HEIGHTS:
+        ok = [d for d in all_damages if reachable(d.damage_repair_height, h)]
+        coverage.append(CherryPickerCoverage(
+            working_height=h,
+            price_without_driver_eur=CHERRY_PICKER_PRICES[h]["sans_chauffeur"],
+            price_with_driver_eur=CHERRY_PICKER_PRICES[h]["avec_chauffeur"],
+            reachable_damages=len(ok),
+            reachable_damages_pct=round(len(ok) * 100 / total, 1) if total else 0.0,
+            reachable_critical_damages=sum(1 for d in ok if d.severity is not None and d.severity > 2),
+            fully_repairable_turbines=sum(
+                1 for t in turbines if t.damages and all(reachable(d.damage_repair_height, h) for d in t.damages)
+            ),
+        ))
+ 
+    nb_critical = sum(1 for d in all_damages if d.severity is not None and d.severity > 2)
+    nb_suspended = sum(
+        1 for d in all_damages
+        if d.damage_repair_height is not None and not reachable(d.damage_repair_height, CHERRY_PICKER_HEIGHTS[-1])
+    )
+ 
+    detail_note = None
+    if total > MAX_DAMAGES_DETAIL:
+        for t in turbines:
+            t.damages = [d for d in t.damages if d.severity is not None and d.severity > 2]
+        nb_detailed = sum(len(t.damages) for t in turbines)
+        if nb_detailed > MAX_DAMAGES_DETAIL:
+            for t in turbines:
+                t.damages = []
+            detail_note = (f"{total} damages found: too many to detail. Statistics cover all damages, "
+                           "but damage detail is omitted. Ask the user to narrow down to one or a few turbines.")
+        else:
+            detail_note = (f"{total} damages found: only the {nb_detailed} damages with severity > 2 are detailed. "
+                           "Statistics cover all damages.")
+ 
+    report = RepairHeightReport(
+        nb_damages=total,
+        nb_critical_damages=nb_critical,
+        damages_needing_suspended_platform=nb_suspended,
+        cherry_picker_coverage=coverage,
+        turbines=turbines,
+        detail_note=detail_note,
+    )
+ 
+    resp = TypeAdapter(RepairHeightReport).dump_json(report).decode()
+    print("--- RES", resp)
+    return resp
+
+
+
 @tool
 def estimate_damage_repair_frequency(individual_damage_id) -> str:
     '''How often damages comparable to a given one end up being repaired.

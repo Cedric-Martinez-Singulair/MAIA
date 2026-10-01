@@ -924,57 +924,62 @@ def manufacturer_damage_stats(defect_type_ids: list[int], component_ids: list[in
         - If no manufacturer stands out, say the data does not point to a manufacturer
           defect and that other causes should be considered.
     """
-
-    print("TOOL_CALL manufacturer_damage_stats", defect_type_ids,component_ids,model_name)
+    print("TOOL_CALL manufacturer_damage_stats", defect_type_ids, component_ids, model_name)
+    
     req_params=[]
     req_str="""WITH m AS (
-    SELECT id, NAME
-    FROM models
+        SELECT id, NAME
+        FROM models
     """
+    
     if model_name:
         req_str+="""
     WHERE REGEXP_REPLACE(NAME, '[^a-zA-Z0-9]', '', 'g') ILIKE %s"""
         req_params.append(f'%{model_name}%')
     req_str+="""),
-blades AS (
-    SELECT
-        c.turbine_id,
-        COALESCE(NULLIF(SUBSTRING(c.blade_serial FROM '^[^0-9]+'), ''), '(aucun)') AS constructor
-    FROM components_turbines_enercon c
-    JOIN turbines t ON t.id = c.turbine_id
-    JOIN m ON m.id = t.model_name
-),
-inc AS (
-    SELECT ir.turbine_id, COUNT(*) AS n_inc
-    FROM incident_records ir
-    WHERE ir.defect_type_id = ANY (%s)"""
+        blades AS (
+            SELECT
+                c.turbine_id,
+                COALESCE(NULLIF(SUBSTRING(c.blade_serial FROM '^[^0-9]+'), ''), '(aucun)') AS constructor
+            FROM components_turbines_enercon c
+            JOIN turbines t ON t.id = c.turbine_id
+            JOIN m ON m.id = t.model_name
+        ),
+        inc AS (
+            SELECT ir.turbine_id, COUNT(*) AS n_inc
+            FROM incident_records ir
+            WHERE ir.defect_type_id = ANY (%s)
+    """
+    
     req_params.append(defect_type_ids)
     if component_ids:
         req_str+="AND ir.component_id = ANY (%s)"
         req_params.append(component_ids)
     req_str+="""
-      AND ir.deleted_at IS NULL
-      AND ir.turbine_id IN (SELECT turbine_id FROM blades)
-    GROUP BY ir.turbine_id
-),
-tot AS (
-    SELECT constructor, COUNT(DISTINCT turbine_id) AS nb_turbines_total
-    FROM blades
-    GROUP BY constructor
-)
-SELECT
-    (SELECT STRING_AGG(DISTINCT NAME, ', ') FROM m) AS modeles,
-    b.constructor,
-    SUM(i.n_inc) AS dmg_quantity,
-    ROUND(SUM(i.n_inc) * 100.0 / SUM(SUM(i.n_inc)) OVER (), 2) AS pourcentage_with_this_damage,
-    COUNT(DISTINCT b.turbine_id) AS nb_turbines_endommagees,
-    tot.nb_turbines_total,
-    ROUND(COUNT(DISTINCT b.turbine_id) * 100.0 / tot.nb_turbines_total, 2) AS pourcentage_turbines_touchees
-FROM blades b
-JOIN inc i ON i.turbine_id = b.turbine_id
-JOIN tot ON tot.constructor = b.constructor
-GROUP BY b.constructor, tot.nb_turbines_total
-ORDER BY dmg_quantity DESC"""
+            AND ir.deleted_at IS NULL
+            AND ir.turbine_id IN (SELECT turbine_id FROM blades)
+            GROUP BY ir.turbine_id
+        ),
+        tot AS (
+            SELECT constructor, COUNT(DISTINCT turbine_id) AS nb_turbines_total
+            FROM blades
+            GROUP BY constructor
+        )
+        SELECT
+            (SELECT STRING_AGG(DISTINCT NAME, ', ') FROM m) AS modeles,
+            b.constructor,
+            SUM(i.n_inc) AS dmg_quantity,
+            ROUND(SUM(i.n_inc) * 100.0 / SUM(SUM(i.n_inc)) OVER (), 2) AS pourcentage_with_this_damage,
+            COUNT(DISTINCT b.turbine_id) AS nb_turbines_endommagees,
+            tot.nb_turbines_total,
+            ROUND(COUNT(DISTINCT b.turbine_id) * 100.0 / tot.nb_turbines_total, 2) AS pourcentage_turbines_touchees
+        FROM blades b
+        JOIN inc i ON i.turbine_id = b.turbine_id
+        JOIN tot ON tot.constructor = b.constructor
+        GROUP BY b.constructor, tot.nb_turbines_total
+        ORDER BY dmg_quantity DESC
+    """
+
     TW_DB_CURSOR.execute(req_str,req_params)
     manufacturer_damage_tab=[]
     for row in TW_DB_CURSOR:

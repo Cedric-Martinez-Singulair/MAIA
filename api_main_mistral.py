@@ -31,7 +31,6 @@ from anthropic import Anthropic
 from get_ids_mcp import *
 from general_mcp import *
 from damage_mcp import *
-from turbine_mcp import *
 from mcp_utils import MAIA_TOOLS
 from maia_utils import TW_DB_CURSOR, GLOBAL_INFOS
 from maia_prompt import *
@@ -47,7 +46,6 @@ DETECTED_LANGUAGES = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
     # with_preloaded_language_models : sinon la première détection paie le
     # chargement des modèles n-grammes, en pleine transcription.
     GLOBAL_STATE["detector"] = (
@@ -308,26 +306,31 @@ def build_persona_prompt(persona_id: str, societe_id: int, language: str) -> str
 CONTINUE_USER_MESSAGE = {
     "fr": "\n\nContinue l'analyse là où tu t'es arrêté.\n\n",
     "en": "\n\nContinue the analysis from where you stopped.\n\n",
+    "de": "\n\nSetzen Sie die Analyse von der Stelle aus fort, an der Sie angehalten haben.\n\n",
 }
 
 PARTIAL_SUFFIX = {
     "fr": "\n\nCeci est une réponse partielle, je continue de chercher.\n\n",
     "en": "\n\nThis is a partial answer, I keep looking.\n\n",
+    "de": "\n\nDas ist eine Teilantwort, ich suche weiter.\n\n",
 }
 
 STOP_ACK = {
     "fr": "\n\nAnalyse interrompue. Vous pouvez poser une nouvelle question.\n\n",
     "en": "\n\nAnalysis stopped. You can ask a new question.\n\n",
+    "de": "\n\nAnalyse gestoppt. Sie können eine neue Frage stellen.\n\n",
 }
 
 SUMMARIZE_MESSAGE = {
     "fr": "Résume pour l'utilisateur ce que tu as trouvé jusqu'à présent en langage simple. \nN'utilise pas de tool. Reste concis. \nTu vas continuer automatiquement. Ne demande PAS à l'utilisateur ce qu'il souhaiterait",
-    "en": "Summarize for the user what you have found so far in plain language. \nDo not call any tools. Keep it concise.\n You will continue automatically. Do NOT ask the user what he would like"
+    "en": "Summarize for the user what you have found so far in plain language. \nDo not call any tools. Keep it concise.\n You will continue automatically. Do NOT ask the user what he would like",
+    "de": "Fassen Sie für den Benutzer in einfacher Sprache zusammen, was Sie bisher gefunden haben. \nRufen Sie keine Tools auf. Halten Sie es prägnant.\n Sie fahren automatisch fort. Fragen Sie den Benutzer NICHT, was er möchte",
 }
 
 ALREADY_SUMMARIZED_PREFIX = {
     "fr": "Ne répète pas le texte suivant, il a déjà été résumé à l'utilisateur :\n",
     "en": "Do not repeat the following text; it has already been summarized to the user :\n",
+    "de": "Wiederholen Sie den folgenden Text nicht; er wurde dem Benutzer bereits zusammengefasst:\n",
 }
 
 class ChatRequest(BaseModel):
@@ -560,6 +563,7 @@ session: Session
     fallback = {
         "fr": "\n\nJe réfléchis...\n\n",
         "en": "\n\nI'm thinking...\n\n",
+        "de": "\n\nIch denke...\n\n",
     }
     return fallback.get(language, fallback["en"])
 
