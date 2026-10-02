@@ -188,6 +188,7 @@ avg_type: Literal["damage_type", "country", "client"] | None = None
 def filter_report(
 campaign_year: int | None = None,
 country_id: int | None = None,
+model_id: int | None = None,
 inspection_type_id: int | None = None,
 client_id: int | None = None
 ) -> str:
@@ -204,15 +205,14 @@ client_id: int | None = None
     
     Args:
         campaign_year: Year of the inspection campaign, e.g. 2026.
-        country_id: Country to filter on. Use get_country_ids_by_name to resolve a
-            country name into its id. Never guess this value.
+        country_id: Country to filter on. Use get_country_ids_by_name to resolve a country name into its id. Never guess this value.
+        model_id: Turbine model id to filter on. Never guess this value.
         inspection_type_id: Inspection type to filter on. Never guess this value.
         client_id: Client Company id to filter on (Singulair user only). Never guess this value.
     Returns:
-        A fenced block tagged "filter" containing the filters as JSON, to be copied
-        verbatim into your answer.
+        A fenced block tagged "filter" containing the filters as JSON, to be copied verbatim into your answer.
     """
-    print("TOOL_CALL filter_report", campaign_year, country_id, inspection_type_id, client_id)
+    print("TOOL_CALL filter_report", campaign_year, country_id, model_id, inspection_type_id, client_id)
     
     country_code = None
     if country_id is not None:
@@ -224,6 +224,7 @@ client_id: int | None = None
         "campaign": campaign_year,
         "country_code": country_code,
         "control_type": inspection_type_id,
+        "model_id": model_id,
         "societe_id": client_id
     }
     filters = {k: v for k, v in filters.items() if v is not None}
@@ -558,7 +559,9 @@ country_id: str | None = None, client_id: int | None = None
 def get_recent_inspections(
 search_mode: Literal["last_days", "last_inspections"],
 search_range: int,
-country_id: str | None = None, client_id: int | None = None
+country_id: str | None = None, client_id: int | None = None,
+damaged_component_id: int | None = None,
+damage_type_id: int | None = None
 ) -> str:
     """Give id and dates of the recent planned inspections
     
@@ -569,19 +572,26 @@ country_id: str | None = None, client_id: int | None = None
         search_mode: Define if the search_range is in days or in number of inspection
         search_range: Range in which we want the inspections
         country_id: Restrict to one country
-        client_id: Restrict to the inspections of a specific client company (Singulair user only).
-
+        client_id: Restrict to the inspections of a specific client company (Singulair user only)
+        damaged_component_id: Restrict to inspections presenting a specific blade component damaged
+        damage_type_id: Restrict to inspections presenting a specific damage type
     Returns:
-        A RecentInspectionsResult holding the total number of inspections in the asked range
+        A RecentInspectionsResult object holding the total number of inspections in the asked range and the details for the first ones.
     """
-    print("TOOL_CALL get_recent_inspections", search_mode, search_range, country_id, client_id)
+    print("TOOL_CALL get_recent_inspections", search_mode, search_range, country_id, client_id, damaged_component_id, damage_type_id)
 
     req_str = " \
-        SELECT planifications.id, planifications.date::TEXT, sites.id, sites.name \
+        SELECT DISTINCT planif_id, planif_date, site_id, site_name FROM ( \
+        SELECT planifications.id AS planif_id, planifications.date::TEXT AS planif_date, sites.id AS site_id, sites.name AS site_name \
         FROM planifications \
         JOIN sites ON planifications.site_id = sites.id \
-        WHERE planifications.deleted_at IS NULL AND planifications.date IS NOT NULL \
     "
+    
+    if damaged_component_id is not None or damage_type_id is not None:
+        req_str += "JOIN incident_records ON incident_records.planification_id = planifications.id "
+    
+    req_str += "WHERE planifications.deleted_at IS NULL AND planifications.date IS NOT NULL "
+    
     req_params = []
     
     if GLOBAL_INFOS['CURRENT_COMPANY_ID'] != 5:
@@ -593,7 +603,15 @@ country_id: str | None = None, client_id: int | None = None
 
     if country_id is not None:
         req_str += "AND sites.country_id = %s "; 
-        req_params.append(country_id) #TODO add filter in RecentInspectionsResult
+        req_params.append(country_id)
+    
+    if damaged_component_id is not None:
+        req_str += "AND incident_records.component_id = %s "
+        req_params.append(damaged_component_id)
+        
+    if damage_type_id is not None:
+        req_str += "AND incident_records.defect_type_id = %s "
+        req_params.append(damage_type_id)
 
     if search_mode == 'last_days':
         req_str += "AND planifications.date >= CURRENT_DATE - %s * INTERVAL '1 day' "
@@ -604,6 +622,8 @@ country_id: str | None = None, client_id: int | None = None
     if search_mode == 'last_inspections':
         req_str += "LIMIT %s "
         req_params.append(search_range)
+    
+    req_str += ") "
 
     print("-- REQ", req_str, req_params)
     TW_DB_CURSOR.execute(req_str, req_params)

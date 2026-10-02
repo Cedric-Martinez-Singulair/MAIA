@@ -306,7 +306,7 @@ def build_persona_prompt(persona_id: str, societe_id: int, language: str) -> str
 CONTINUE_USER_MESSAGE = {
     "fr": "\n\nContinue l'analyse là où tu t'es arrêté.\n\n",
     "en": "\n\nContinue the analysis from where you stopped.\n\n",
-    "de": "\n\nSetzen Sie die Analyse von der Stelle aus fort, an der Sie angehalten haben.\n\n",
+    "de": "\n\nSetze die Analyse dort fort, wo du aufgehört hast.\n\n",
 }
 
 PARTIAL_SUFFIX = {
@@ -318,19 +318,19 @@ PARTIAL_SUFFIX = {
 STOP_ACK = {
     "fr": "\n\nAnalyse interrompue. Vous pouvez poser une nouvelle question.\n\n",
     "en": "\n\nAnalysis stopped. You can ask a new question.\n\n",
-    "de": "\n\nAnalyse gestoppt. Sie können eine neue Frage stellen.\n\n",
+    "de": "\n\nAnalyse wurde gestoppt. Du kannst eine neue Frage stellen.\n\n",
 }
 
 SUMMARIZE_MESSAGE = {
-    "fr": "Résume pour l'utilisateur ce que tu as trouvé jusqu'à présent en langage simple. \nN'utilise pas de tool. Reste concis. \nTu vas continuer automatiquement. Ne demande PAS à l'utilisateur ce qu'il souhaiterait",
+    "fr": "Résume pour l'utilisateur ce que tu as trouvé jusqu'à présent en langage simple. \nN'utilise pas de tools. Reste concis. \nTu vas continuer automatiquement. Ne demande PAS à l'utilisateur ce qu'il souhaiterait",
     "en": "Summarize for the user what you have found so far in plain language. \nDo not call any tools. Keep it concise.\n You will continue automatically. Do NOT ask the user what he would like",
-    "de": "Fassen Sie für den Benutzer in einfacher Sprache zusammen, was Sie bisher gefunden haben. \nRufen Sie keine Tools auf. Halten Sie es prägnant.\n Sie fahren automatisch fort. Fragen Sie den Benutzer NICHT, was er möchte",
+    "de": "Fasse für den Nutzer in einfacher Sprache zusammen, was du bisher herausgefunden hast. \nRufe keine Tools auf. Halte dich kurz. \nDu wirst automatisch weitermachen. Frage den Nutzer NICHT, was er als Nächstes möchte.",
 }
 
 ALREADY_SUMMARIZED_PREFIX = {
     "fr": "Ne répète pas le texte suivant, il a déjà été résumé à l'utilisateur :\n",
     "en": "Do not repeat the following text; it has already been summarized to the user :\n",
-    "de": "Wiederholen Sie den folgenden Text nicht; er wurde dem Benutzer bereits zusammengefasst:\n",
+    "de": "Wiederhole den folgenden Text nicht; er wurde dem Nutzer bereits zusammengefasst:\n",
 }
 
 class ChatRequest(BaseModel):
@@ -563,7 +563,7 @@ session: Session
     fallback = {
         "fr": "\n\nJe réfléchis...\n\n",
         "en": "\n\nI'm thinking...\n\n",
-        "de": "\n\nIch denke...\n\n",
+        "de": "\n\nIch denke nach...\n\n",
     }
     return fallback.get(language, fallback["en"])
 

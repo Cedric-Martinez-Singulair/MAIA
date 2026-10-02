@@ -1,3 +1,4 @@
+from ast import Raise
 import json
 from statistics import mean
 
@@ -525,39 +526,38 @@ def get_individual_damage_infos(individual_damage_id: int) -> str:
     return resp
 
 
-# Hauteur de travail (m) -> prix de location journalier HT (€)
-# Tarifs indicatifs constatés pour 1 jour de location (chauffeur/opérateur inclus pour > 30 m)
-CHERRY_PICKER_PRICES: dict[int, dict[str, float | None]] = {
-    27: {"sans_chauffeur": 900, "avec_chauffeur": 1400},
-    37: {"sans_chauffeur": None, "avec_chauffeur": 2100},
-    40: {"sans_chauffeur": None, "avec_chauffeur": 2400},
-    47: {"sans_chauffeur": None, "avec_chauffeur": 2800},
-    51: {"sans_chauffeur": None, "avec_chauffeur": 3100},
-    54: {"sans_chauffeur": None, "avec_chauffeur": 3400},
-    65: {"sans_chauffeur": None, "avec_chauffeur": 4200},
-    72: {"sans_chauffeur": None, "avec_chauffeur": 4800},
-    75: {"sans_chauffeur": None, "avec_chauffeur": 5200},
-    90: {"sans_chauffeur": None, "avec_chauffeur": 6800},
-    100: {"sans_chauffeur": None, "avec_chauffeur": 8500},
+# Hauteur de travail (m) -> prix journalier indicatif HT avec chauffeur/opérateur (€)
+CHERRY_PICKER_PRICES: dict[int, float | None] = {
+    27: 1400,
+    37: 2100,
+    40: 2400,
+    47: 2800,
+    51: 3100,
+    54: 3400,
+    65: 4200,
+    72: 4800,
+    75: 5200,
+    90: 6800,
+    100: 8500,
 }
 
+
 CHERRY_PICKER_HEIGHTS: list[int] = sorted(CHERRY_PICKER_PRICES)
-OPERATOR_INCLUDED_ABOVE_M = 30
 SUSPENDED_PLATFORM = "Suspended platform"
 SAFETY_MARGIN_M = 2.0  # marge entre la hauteur du dégât et la hauteur de travail
 MAX_DAMAGES_DETAIL = 150
- 
- 
+
+
 def reachable(height: float | None, working_height: float) -> bool:
     return height is not None and height + SAFETY_MARGIN_M <= working_height
- 
- 
+
+
 def recommended_height(height: float | None) -> int | None:
     if height is None:
         return None
     return next((h for h in CHERRY_PICKER_HEIGHTS if reachable(height, h)), None)
- 
- 
+
+
 def recommend_equipment(height: float | None) -> str:
     if height is None:
         return "Unknown (missing tower_height or radius)"
@@ -571,32 +571,30 @@ def get_repair_damage_height(inspection_id: int,
                           defect_type_ids: list[int] | None = None):
     """
     Get the repair height of blade damages, how many of them each cherry picker height can reach,
-    and the indicative daily rental price of each cherry picker (with / without driver).
+    and the indicative daily rental price (with driver) of each cherry picker.
     ALWAYS call this tool whenever repair is mentioned in any way (repair, fix, maintenance,
     intervention, "what should I do about this damage"...), even if the user does not ask
     for heights or equipment. Use the result to advise the user on how to carry out the repair.
-
+ 
     Args:
         inspection_id: The inspection (planification) ID. Alone, it covers the whole site.
         turbine_ids: Turbines to include. None = all turbines of the inspection.
         defect_type_ids: Damage types to include. A damage name can have several IDs,
             so include all IDs with the same or similar name. None = all damages.
-
+ 
     Returns:
         - cherry_picker_coverage: for each standard cherry picker height, its indicative daily
-          prices (with / without driver), the number and share of damages it can reach, and the turbines fully repairable
+          price (with driver), the number and share of damages it can reach, and the turbines fully repairable
         - damages_needing_suspended_platform: damages too high for any cherry picker
         - turbines: heights (min / avg / max), max severity, smallest equipment and its price,
           damage detail
         repair height = tower_height - radius (blade pointing down).
-
+ 
     How to answer:
         - Focus on coverage vs price: "a X m cherry picker reaches N damages (P%) for ~Y €/day",
           compare a few relevant heights, and say what is left for a suspended platform.
-        - Prices are indicative market rates excl. VAT for 1 day, with and without driver,
+        - Prices are indicative market rates excl. VAT for 1 day, driver/operator included,
           only to give an order of magnitude: always say they must be confirmed with a rental quote.
-          Above ~30 m, truck-mounted cherry pickers are only rented with a driver/operator
-          (CACES R486 cat. B, truck licence, insurance), hence no price without driver.
           Never invent a price, never give one for the suspended platform.
         - Heights and prices are market references only: never mention a provider or brand,
           and never say the equipment is available, owned or rented by us.
@@ -671,8 +669,7 @@ def get_repair_damage_height(inspection_id: int,
             min_damage_repair_height=min(heights) if heights else None,
             max_damage_repair_height=max_h,
             recommended_equipment=recommend_equipment(max_h),
-            recommended_price_without_driver_eur=CHERRY_PICKER_PRICES[rec_h]["sans_chauffeur"] if rec_h else None,
-            recommended_price_with_driver_eur=CHERRY_PICKER_PRICES[rec_h]["avec_chauffeur"] if rec_h else None,
+            recommended_equipment_daily_price_eur=CHERRY_PICKER_PRICES[rec_h] if rec_h else None,
             damages=t["damages"],
         ))
  
@@ -683,8 +680,7 @@ def get_repair_damage_height(inspection_id: int,
         ok = [d for d in all_damages if reachable(d.damage_repair_height, h)]
         coverage.append(CherryPickerCoverage(
             working_height=h,
-            price_without_driver_eur=CHERRY_PICKER_PRICES[h]["sans_chauffeur"],
-            price_with_driver_eur=CHERRY_PICKER_PRICES[h]["avec_chauffeur"],
+            daily_price_eur=CHERRY_PICKER_PRICES[h],
             reachable_damages=len(ok),
             reachable_damages_pct=round(len(ok) * 100 / total, 1) if total else 0.0,
             reachable_critical_damages=sum(1 for d in ok if d.severity is not None and d.severity > 2),
@@ -725,7 +721,6 @@ def get_repair_damage_height(inspection_id: int,
     resp = TypeAdapter(RepairHeightReport).dump_json(report).decode()
     print("--- RES", resp)
     return resp
-
 
 
 @tool
@@ -1497,7 +1492,7 @@ turbine_ids: list[int] | None = None
         
     resp = TypeAdapter(list[TurbineErosionDetails]).dump_json(turbine_details).decode(); print("--- RES", resp)
     return resp
-    
+
 @tool
 def get_inspection_crack_details(site_id: int,
                                  inspection_id: int,
@@ -1623,7 +1618,6 @@ def get_inspection_crack_details(site_id: int,
     return resp
 
 
-
 # =========================================================================== #
 # BLOC 2 — mise en forme
 # =========================================================================== #
@@ -1636,7 +1630,7 @@ def count_cracks(cracks):
         repaired=sum(1 for c in cracks if c.status == "repaired"),
         stable=sum(1 for c in cracks if c.status == "stable"),
     )
- 
+
 def sum_counts(counts_list):
     """Addition de plusieurs CrackCounts. Des comptages, ça s'additionne."""
     return CrackCounts(
@@ -1646,7 +1640,7 @@ def sum_counts(counts_list):
         repaired=sum(c.repaired for c in counts_list),
         stable=sum(c.stable for c in counts_list),
     )
- 
+
 def build_crack_model(crack):
     """Une fissure brute -> CrackEvolutionDetails."""
     growth = crack["size_delta"]
@@ -1669,8 +1663,8 @@ def build_crack_model(crack):
         wind=crack["wind"],
         growth_was_predicted=crack["growth_was_predicted"],
     )
- 
- 
+
+
 def build_turbine_crack_evolution(turbine, turbines_by_id):
     """Sortie brute d'une turbine -> TurbineCrackEvolution."""
     # Les fissures arrivent à plat : on les regroupe par pale.
@@ -1713,8 +1707,8 @@ def build_turbine_crack_evolution(turbine, turbines_by_id):
         longest_crack=max(turbine_lengths) if turbine_lengths else None,
         blades=blade_models,
     )
- 
- 
+
+
 # =========================================================================== #
 # BLOC 3 — le tool
 # =========================================================================== #
@@ -1865,11 +1859,11 @@ def analyse_crack_evolution(inspection_id: int,
 # blade: str | None = None,
 # only_changed: bool = False) -> str:
 #     '''Tell how the cracks of a turbine evolved between two inspection campaigns.
- 
+
 #     Use this when the user asks whether a crack grew, whether damages got worse
 #     on a turbine, what changed since the last inspection, or which cracks were
 #     repaired.
- 
+
 #     Args:
 #         turbine_id: Identifier of the turbine to analyse.
 #         inspection_id: The campaign to look at.
@@ -1878,7 +1872,7 @@ def analyse_crack_evolution(inspection_id: int,
 #         blade: Optional. Restricts the answer to one blade, "A", "B" or "C".
 #         only_changed: Set True to drop unchanged cracks
 #             and keep only what is new, grown or repaired.
- 
+
 #     Returns:
 #         The two campaigns compared, and one entry per crack with its blade, face,
 #         radius, shape, severity and WIND index, its current and previous size in
@@ -1893,36 +1887,36 @@ def analyse_crack_evolution(inspection_id: int,
 #     '''
 #     print("TOOL_CALL analyse_crack_evolution", turbine_id, inspection_id,
 #           previous_inspection_id, blade, only_changed)
- 
+
 #     if previous_inspection_id is None:
 #         previous_inspection_id = resolve_previous_planification(turbine_id, inspection_id)
 #         if previous_inspection_id is None:
 #             res = "ERROR: no earlier inspection campaign with damages for this turbine, there is nothing to compare with"
 #             print(res)
 #             return res
- 
+
 #     full_data = fetch_crack_data(inspection_id, turbine_id)
 #     previous_full_data = fetch_crack_data(previous_inspection_id, turbine_id)
- 
+
 #     evolutions = []
- 
+
 #     for current_blade in ([blade] if blade else BLADES):
 #         blade_data = select_blade(full_data, current_blade)
 #         previous_blade_data = select_blade(previous_full_data, current_blade)
- 
+
 #         if blade_data.empty and previous_blade_data.empty:
 #             continue
- 
+
 #         #TODO vérifier si les cracks qui ont "rétrécis" sont remontés ou pas, c'est pas clair
 #         evolutions.extend(compare_blade_cracks(
 #             build_cracks_by_face(blade_data),
 #             build_cracks_by_face(previous_blade_data),
 #             current_blade,
 #         ))
- 
+
 #     if only_changed:
 #         evolutions = [e for e in evolutions if e.status != "stable"]
- 
+
 #     #TODO mettre toutes les infos dans des objets
 #     res = json.dumps({
 #         "turbine_id": turbine_id,
@@ -1930,7 +1924,7 @@ def analyse_crack_evolution(inspection_id: int,
 #         "previous_inspection_id": previous_inspection_id,
 #         "cracks": [asdict(e) for e in evolutions],
 #     }, default=str)
- 
+
 #     print("-- RES", res)
 #     return res
 
@@ -1966,5 +1960,256 @@ def get_recent_severity_5_damage(look_back_days: int = 30, country_id: int | Non
     
     resp = TypeAdapter(list[Damage]).dump_json(result).decode(); print("--- RES", resp)
     return resp
+
+@tool
+def compare_erosion_sizes(
+inspection_id: int,
+site_to_compare_id: int | None,
+age: int | None,
+country_id: int | None,
+site_ids: list[int] | None,
+turbine_model: str | None
+) -> str:
+    """Compare the leading edge erosion of one site with a reference group of turbines.
+
+    Returns two sets of statistics:
+    - the reference group, built from the comparison filters (age, country_id,
+      site_ids, turbine_model): every turbine inspection matching ALL the given filters;
+    - the site to compare, at the given inspection.
+
+    Statistics are given for the whole turbine (sum of the 3 blades) and per blade
+    (all blades pooled together, not A / B / C separately): number of samples,
+    mean and median of the eroded length and of the laminate eroded length, in meters.
+
+    Use this tool when the user asks whether a site is more or less eroded than
+    comparable turbines: same age, same country, same model, or nearby sites.
+
+    At least one comparison filter is required: age, country_id, site_ids or turbine_model.
+
+    Args:
+        inspection_id: Inspection of the site to compare.
+        site_to_compare_id: Site whose erosion is compared to the reference group.
+        age: Turbine age in years at the inspection date. Keeps only turbines of that age.
+        country_id: Keeps only turbines located in this country.
+        site_ids: Keeps only turbines of these sites. To compare with a geographic area,
+            first call get_nearest_sites to get the 25 nearest sites, then pass their ids here.
+        turbine_model: Turbine model to compare with, e.g. "V90". Spaces, dashes, underscores
+            and dots are ignored ("V 90", "V-90" and "V_90" all match), and the model name
+            only needs to start with it ("V90" also matches "V90-2.0").
+
+    Returns:
+        A list of two ErosionStats: the reference group first, then the site to compare
+        (with its name and coordinates).
+    """
+    print("TOOL_CALL compare_erosion_size", inspection_id, site_to_compare_id, age, country_id, site_ids, turbine_model)
     
+    tw_db_connection = psycopg2.connect(
+        dbname="windwatch",
+        user="windwatch",
+        password="windwatch",
+        host="localhost",
+        port=5432,
+    )
+    tmp_TW_DB_CURSOR = tw_db_connection.cursor()
+
+    if not age and not country_id and not site_ids and not turbine_model:
+        raise TypeError('The tool should be called with at least one of these arguments: age; country_id; site_ids; turbine_model')
+
+    req_params = []
+    req_str = """
+        WITH base AS (
+        SELECT DISTINCT ON (erosion_history.turbine_id, erosion_history.inspection_id)
+            erosion_history.*,
+            ((planifications.date::date - COALESCE(turbines.entry_service, operations.entry_service)::date) / 365.25)::INT AS age,
+            models.name AS model_name
+        FROM erosion_history
+        JOIN turbines       ON turbines.id = erosion_history.turbine_id
+        JOIN planifications ON planifications.id = inspection_id
+        JOIN operations     ON operations.site_id = turbines.site_id
+        JOIN models         ON models.id = turbines.model_name
+        JOIN sites          ON sites.id = turbines.site_id
+        WHERE
+    """
     
+    where_found = False
+    if age:
+        req_str += "((planifications.date::date - COALESCE(turbines.entry_service, operations.entry_service)::date) / 365.25)::INT = %s "
+        req_params.append(age)
+        where_found = True
+    if turbine_model:
+        if where_found: req_str += "AND "
+        req_str += "lower(regexp_replace(models.name, '[\s\-_.]', '', 'g')) LIKE lower(regexp_replace(%s, '[\s\-_.]', '', 'g')) || '%%' "
+        req_params.append(turbine_model)
+        where_found = True
+    if country_id:
+        if where_found: req_str += "AND "
+        req_str += "sites.country_id = %s "
+        req_params.append(country_id)
+        where_found = True
+    if site_ids:
+        if where_found: req_str += "AND "
+        req_str += "sites.id = ANY (%s) "
+        req_params.append(site_ids)
+        where_found = True
+        
+    req_str += """),
+        blades AS (
+            SELECT b.erosion, b.laminate
+            FROM base
+            CROSS JOIN LATERAL (VALUES
+                (base.blade_a_erosion_size, base.blade_a_laminate_erosion_size),
+                (base.blade_b_erosion_size, base.blade_b_laminate_erosion_size),
+                (base.blade_c_erosion_size, base.blade_c_laminate_erosion_size)
+            ) AS b(erosion, laminate)
+        )
+        SELECT 
+            
+            (SELECT COUNT(*) FROM base) AS nb_turbines_inspections,
+
+            (SELECT ROUND(AVG(erosion_size)::NUMERIC, 3) FROM base) AS avg_erosion,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY erosion_size))::NUMERIC, 3)
+            FROM base) AS median_erosion,
+
+            (SELECT ROUND(AVG(laminate_erosion_size)::NUMERIC, 3) FROM base) AS avg_laminate,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY laminate_erosion_size))::NUMERIC, 3)
+            FROM base) AS median_laminate,
+
+            (SELECT COUNT(*) FROM blades) AS nb_blades,
+
+            (SELECT ROUND(AVG(erosion)::NUMERIC, 3) FROM blades) AS avg_blade_erosion,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY erosion))::NUMERIC, 3)
+            FROM blades) AS median_blade_erosion,
+
+            (SELECT ROUND(AVG(laminate)::NUMERIC, 3) FROM blades) AS avg_blade_laminate,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY laminate))::NUMERIC, 3)
+            FROM blades) AS median_blade_laminate;
+    """
+    
+    print("--- REQ " , req_str, req_params)
+    tmp_TW_DB_CURSOR.execute(req_str, req_params)
+    (
+        nb_turbines_inspections,
+        avg_erosion,
+        median_erosion,
+        avg_laminate,
+        median_laminate,
+        nb_blades,
+        avg_blade_erosion,
+        median_blade_erosion,
+        avg_blade_laminate,
+        median_blade_laminate,
+    ) = tmp_TW_DB_CURSOR.fetchone()
+
+    result = []
+    result.append(
+        ErosionStats(
+            nb_turbines_inspections=nb_turbines_inspections,
+            avg_erosion_size=avg_erosion,
+            median_erosion_size=median_erosion,
+            avg_laminate_size=avg_laminate,
+            median_laminate_size=median_laminate,
+            nb_blades=nb_blades,
+            avg_blade_erosion=avg_blade_erosion,
+            median_blade_erosion_size=median_blade_erosion,
+            avg_blade_laminate=avg_blade_laminate,
+            median_blade_laminate=median_blade_laminate,
+            site=None
+        )
+    )
+    
+    req_str = """
+            WITH base AS (
+            SELECT DISTINCT ON (erosion_history.turbine_id, erosion_history.inspection_id)
+                erosion_history.*,
+                ((planifications.date::date - COALESCE(turbines.entry_service, operations.entry_service)::date) / 365.25)::INT AS age,
+                models.name AS model_name,
+                sites.name AS site_name,
+                sites.longitude AS longitude,
+                sites.latitude AS latitude
+            FROM erosion_history
+            JOIN turbines       ON turbines.id = erosion_history.turbine_id
+            JOIN planifications ON planifications.id = inspection_id
+            JOIN operations     ON operations.site_id = turbines.site_id
+            JOIN models         ON models.id = turbines.model_name
+            JOIN sites          ON sites.id = turbines.site_id
+            WHERE planifications.id = %s
+            AND sites.id = %s
+            
+            ),
+        blades AS (
+            SELECT b.erosion, b.laminate
+            FROM base
+            CROSS JOIN LATERAL (VALUES
+                (base.blade_a_erosion_size, base.blade_a_laminate_erosion_size),
+                (base.blade_b_erosion_size, base.blade_b_laminate_erosion_size),
+                (base.blade_c_erosion_size, base.blade_c_laminate_erosion_size)
+            ) AS b(erosion, laminate)
+        )
+        SELECT 
+            (SELECT MAX(site_name) FROM base) AS site_name,
+            (SELECT MAX(longitude) FROM base) AS longitude,
+            (SELECT MAX(latitude)FROM base) AS latitude,
+            
+            (SELECT COUNT(*) FROM base) AS nb_turbines_inspections,
+
+            (SELECT ROUND(AVG(erosion_size)::NUMERIC, 3) FROM base) AS avg_erosion,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY erosion_size))::NUMERIC, 3)
+            FROM base) AS median_erosion,
+
+            (SELECT ROUND(AVG(laminate_erosion_size)::NUMERIC, 3) FROM base) AS avg_laminate,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY laminate_erosion_size))::NUMERIC, 3)
+            FROM base) AS median_laminate,
+
+            (SELECT COUNT(*) FROM blades) AS nb_blades,
+
+            (SELECT ROUND(AVG(erosion)::NUMERIC, 3) FROM blades) AS avg_blade_erosion,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY erosion))::NUMERIC, 3)
+            FROM blades) AS median_blade_erosion,
+
+            (SELECT ROUND(AVG(laminate)::NUMERIC, 3) FROM blades) AS avg_blade_laminate,
+            (SELECT ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY laminate))::NUMERIC, 3)
+            FROM blades) AS median_blade_laminate;
+        """
+    req_params = [inspection_id, site_to_compare_id]
+    
+    print("--- REQ ", req_str, req_params)
+    tmp_TW_DB_CURSOR.execute(req_str, req_params)
+    (
+        site_name,
+        longitude,
+        latitude,
+        nb_turbines_inspections,
+        avg_erosion,
+        median_erosion,
+        avg_laminate,
+        median_laminate,
+        nb_blades,
+        avg_blade_erosion,
+        median_blade_erosion,
+        avg_blade_laminate,
+        median_blade_laminate,
+    ) = tmp_TW_DB_CURSOR.fetchone()
+    
+    result.append(
+        ErosionStats(
+            nb_turbines_inspections=nb_turbines_inspections,
+            avg_erosion_size=avg_erosion,
+            median_erosion_size=median_erosion,
+            avg_laminate_size=avg_laminate,
+            median_laminate_size=median_laminate,
+            nb_blades=nb_blades,
+            avg_blade_erosion=avg_blade_erosion,
+            median_blade_erosion_size=median_blade_erosion,
+            avg_blade_laminate=avg_blade_laminate,
+            median_blade_laminate=median_blade_laminate,
+            site=Site(
+                id =site_to_compare_id,
+                name=site_name,
+                longitude=longitude,
+                latitude=latitude
+            )
+        )
+    )
+    tmp_TW_DB_CURSOR.close()
+    resp = TypeAdapter(list[ErosionStats]).dump_json(result).decode(); print("--- RES", resp)
+    return resp

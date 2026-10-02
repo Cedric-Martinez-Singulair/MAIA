@@ -164,6 +164,21 @@ class TurbineErosionDetails(BaseModel):
     b_details: BladeErosionDetails | Literal['No erosion'] = Field(description='Erosion details for blade B')
     c_details: BladeErosionDetails | Literal['No erosion'] = Field(description='Erosion details for blade C')
 
+
+# Compare Erosion
+class ErosionStats(BaseModel):
+    nb_turbines_inspections: int = Field(description='The number of turbines based on these stats')
+    avg_erosion_size: float | None = Field(default='No Data', description='The average size (in meters) of erosion for a turbine with these parameters')
+    median_erosion_size:float | None = Field(default='No Data', description='The median erosion size (in meters) for a turbine with these parameters')
+    avg_laminate_size: float | None = Field(default='No Data', description='The average laminate size (in meters) for a turbine with these parameters')
+    median_laminate_size: float | None = Field(default='No Data', description='The average laminate size (in meters) for a turbine with these parameters')
+    nb_blades:int = Field(description='The number of blades used based on these stats')
+    avg_blade_erosion: float | None = Field(default='No Data', description='The average erosion size (in meters) for a blade with these parameters')
+    median_blade_erosion_size: float | None = Field(default='No Data', description='The median erosion size (in meters) for a blade with these parameters')
+    avg_blade_laminate: float | None = Field(default='No Data', description='The average laminate size (in meters) for a blade with these parameters')
+    median_blade_laminate: float | None = Field(default='No Data', description='The median laminate size (in meters) for a blade with these parameters')
+    site: Site | None = Field(defalut = None, description='The Site we are comparing the data to')
+    
 # Repair cost
 
 class DamageGroupRepairCost(BaseModel):
@@ -210,12 +225,12 @@ class TurbineRepairSummary(BaseModel):
  
 class CherryPickerCoverage(BaseModel):
     working_height: int = Field(description="Cherry picker working height (m)")
-    price_without_driver_eur: float | None = Field(description="Indicative daily price excl. VAT without driver (EUR), None if not offered")
-    price_with_driver_eur: float | None = Field(description="Indicative daily price excl. VAT with driver/operator (EUR), None if unknown")
+    daily_price_eur: float | None = Field(description="Indicative daily price excl. VAT, with driver/operator (EUR), None if unknown")
     reachable_damages: int = Field(description="Number of damages this cherry picker can reach")
     reachable_damages_pct: float = Field(description="Share of all damages it can reach (%)")
     reachable_critical_damages: int = Field(description="Number of reachable damages with severity > 2")
     fully_repairable_turbines: int = Field(description="Turbines where every damage can be reached")
+
  
  
 class RepairHeightReport(BaseModel):

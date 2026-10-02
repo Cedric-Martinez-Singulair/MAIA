@@ -201,9 +201,11 @@ def get_manufacturer(site_id:int):
     Returns:
         A list of TurbineModel
     '''
+    print("TOOL_CALL get_manufacturer", site_id)
     req_params = []
-    req_str="""  SELECT
+    req_str="""SELECT
     t.id AS turbine_id,
+    t.pad_name AS turbine_name,
     m.name AS model_name,
     STRING_AGG(DISTINCT COALESCE(NULLIF(SUBSTRING(c.blade_serial FROM '^[^0-9]+'), ''), '(aucun)'), ', ') AS manufacturer
     FROM turbines t
@@ -213,18 +215,20 @@ def get_manufacturer(site_id:int):
     GROUP BY t.id, m.name
     ORDER BY t.id;"""
     req_params.append(site_id)
-    
+
     TW_DB_CURSOR.execute(req_str,req_params)
-    
+
     result=[]
     for row in TW_DB_CURSOR:
-        id,model,manufacturer = row
-        result.append(TurbineModel(id=id,
-                                     name=model,
-                                     manufacturer=manufacturer))
-    
-    resp = TypeAdapter(list[TurbineModel]).dump_json(result).decode(); print("--- RES", resp) 
-    
-    ##TODO renvoyer une Turbine plutot qu'un TurbineModel comme ca on a le nom de la turbine
-    
+        id, turbine_name, model, manufacturer = row
+        result.append(
+            Turbine(
+                id=id,
+                name=turbine_name,
+                model=TurbineModel(id=id, name=model, manufacturer=manufacturer),
+            )
+        )
+
+    resp = TypeAdapter(list[Turbine]).dump_json(result).decode(); print("--- RES", resp)
+
     return resp

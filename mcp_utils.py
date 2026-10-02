@@ -45,5 +45,6 @@ MAIA_TOOLS = [
     get_month_inspections,
     get_recent_inspections,
     prioritize_campaign_repair,
-    manufacturer_damage_stats
+    manufacturer_damage_stats,
+    compare_erosion_sizes
 ]
